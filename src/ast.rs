@@ -1,8 +1,9 @@
-use crate::types::Type;
+use crate::types::{Aggregates, Type};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub functions: Vec<FuncDef>,
+    pub aggregates: Aggregates,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +60,11 @@ pub enum Expr {
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
+    },
+    Member {
+        base: Box<Expr>,
+        field: String,
+        arrow: bool,
     },
     SizeofType(Type),
     SizeofExpr(Box<Expr>),
