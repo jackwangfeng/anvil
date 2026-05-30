@@ -1,11 +1,12 @@
 use crate::span::Span;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     KwInt,
     KwReturn,
     Ident(String),
     IntLit(i64),
+    FloatLit(f64),
     StrLit(String),
     LParen,
     RParen,
@@ -65,6 +66,7 @@ pub enum TokenKind {
     KwTypedef,
     KwVoid,
     KwConst,
+    KwDouble,
     KwBreak,
     KwContinue,
     KwSwitch,
@@ -73,7 +75,7 @@ pub enum TokenKind {
     Eof,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,

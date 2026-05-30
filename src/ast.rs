@@ -1,6 +1,6 @@
 use crate::types::{Aggregates, Signatures, Type};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub functions: Vec<FuncDef>,
     pub aggregates: Aggregates,
@@ -15,7 +15,7 @@ pub struct Global {
     pub init: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FuncDef {
     pub name: String,
     pub params: Vec<(String, Type)>,
@@ -23,7 +23,7 @@ pub struct FuncDef {
     pub body: Vec<Stmt>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Return(Expr),
     /// <type> <name>;  或  <type> <name> = <init>;  或  <type> <name>[N];
@@ -60,9 +60,10 @@ pub enum Stmt {
     Empty,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     IntLit(i64),
+    FloatLit(f64),
     Var(String),
     StrLit(String),
     Call {

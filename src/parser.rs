@@ -101,6 +101,7 @@ impl<'a> Parser<'a> {
         match self.peek_kind() {
             TokenKind::KwInt
             | TokenKind::KwChar
+            | TokenKind::KwDouble
             | TokenKind::KwVoid
             | TokenKind::KwConst
             | TokenKind::KwStruct
@@ -225,6 +226,10 @@ impl<'a> Parser<'a> {
             TokenKind::KwChar => {
                 self.pos += 1;
                 Type::Char
+            }
+            TokenKind::KwDouble => {
+                self.pos += 1;
+                Type::Double
             }
             TokenKind::KwStruct | TokenKind::KwUnion => {
                 let save = self.pos;
@@ -791,6 +796,11 @@ impl<'a> Parser<'a> {
                 let v = *v;
                 self.pos += 1;
                 Ok(Expr::IntLit(v))
+            }
+            TokenKind::FloatLit(v) => {
+                let v = *v;
+                self.pos += 1;
+                Ok(Expr::FloatLit(v))
             }
             TokenKind::StrLit(s) => {
                 let s = s.clone();
