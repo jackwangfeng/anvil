@@ -7,18 +7,18 @@ pub fn generate(program: &Program) -> String {
     for func in &program.functions {
         gen_func(func, &mut out);
     }
+    gen_strings(&program.strings, &mut out);
     out
 }
 
-/// 临时量 i 的栈槽：相对 sp 偏移 i*4 字节。
+/// 槽位 i：相对 sp 偏移 i*8 字节（8 字节以容纳指针）。
 fn slot(t: usize) -> usize {
-    t * 4
+    t * 8
 }
 
-/// 栈帧大小：num_temps*4 向上对齐到 16；0 个临时量则无帧。
+/// 栈帧大小：num_slots*8 向上对齐到 16。
 fn frame_size(num_temps: usize) -> usize {
-    let bytes = num_temps * 4;
-    bytes.div_ceil(16) * 16
+    (num_temps * 8).div_ceil(16) * 16
 }
 
 fn gen_func(func: &Function, out: &mut String) {
@@ -26,15 +26,32 @@ fn gen_func(func: &Function, out: &mut String) {
     let _ = writeln!(out, ".globl _{}", func.name);
     out.push_str(".p2align 2\n");
     let _ = writeln!(out, "_{}:", func.name);
+    out.push_str("    stp x29, x30, [sp, #-16]!\n");
+    out.push_str("    mov x29, sp\n");
     if frame > 0 {
         let _ = writeln!(out, "    sub sp, sp, #{}", frame);
     }
     for instr in &func.body {
-        gen_instr(instr, frame, out);
+        gen_instr(instr, &func.name, frame, out);
     }
 }
 
-fn gen_instr(instr: &Instr, frame: usize, out: &mut String) {
+fn gen_strings(strings: &[String], out: &mut String) {
+    if strings.is_empty() {
+        return;
+    }
+    out.push_str(".section __TEXT,__cstring,cstring_literals\n");
+    for (i, s) in strings.iter().enumerate() {
+        let _ = writeln!(out, "L_.str.{}:", i);
+        out.push_str("    .byte ");
+        for b in s.as_bytes() {
+            let _ = write!(out, "{}, ", b);
+        }
+        out.push_str("0\n");
+    }
+}
+
+fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
     match instr {
         Instr::Const { dst, value } => {
             materialize_const(*value, out);
@@ -58,14 +75,29 @@ fn gen_instr(instr: &Instr, frame: usize, out: &mut String) {
             let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
         }
         Instr::Label(n) => {
-            let _ = writeln!(out, "L{}:", n);
+            let _ = writeln!(out, "L{}_{}:", func, n);
         }
         Instr::Jump(n) => {
-            let _ = writeln!(out, "    b L{}", n);
+            let _ = writeln!(out, "    b L{}_{}", func, n);
         }
         Instr::JumpIfZero { cond, target } => {
             let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*cond));
-            let _ = writeln!(out, "    cbz w9, L{}", target);
+            let _ = writeln!(out, "    cbz w9, L{}_{}", func, target);
+        }
+        Instr::LoadArg { dst, index } => {
+            let _ = writeln!(out, "    str w{}, [sp, #{}]", index, slot(*dst));
+        }
+        Instr::StrLit { dst, index } => {
+            let _ = writeln!(out, "    adrp x9, L_.str.{}@PAGE", index);
+            let _ = writeln!(out, "    add x9, x9, L_.str.{}@PAGEOFF", index);
+            let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
+        Instr::Call { dst, name, args } => {
+            for (i, a) in args.iter().enumerate() {
+                let _ = writeln!(out, "    ldr x{}, [sp, #{}]", i, slot(*a));
+            }
+            let _ = writeln!(out, "    bl _{}", name);
+            let _ = writeln!(out, "    str w0, [sp, #{}]", slot(*dst));
         }
         Instr::Bin { dst, op, lhs, rhs } => {
             let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*lhs));
@@ -94,6 +126,7 @@ fn gen_instr(instr: &Instr, frame: usize, out: &mut String) {
             if frame > 0 {
                 let _ = writeln!(out, "    add sp, sp, #{}", frame);
             }
+            out.push_str("    ldp x29, x30, [sp], #16\n");
             out.push_str("    ret\n");
         }
     }
@@ -122,6 +155,7 @@ mod tests {
                 body: func_body,
                 num_temps,
             }],
+            strings: vec![],
         })
     }
 
@@ -149,9 +183,9 @@ mod tests {
             3,
         );
         assert!(asm.contains("add w9, w9, w10"));
-        // 栈帧：3 个临时量 *4 = 12，向上对齐到 16
-        assert!(asm.contains("sub sp, sp, #16"));
-        assert!(asm.contains("add sp, sp, #16"));
+        // 栈帧：3 个槽 *8 = 24，向上对齐到 32
+        assert!(asm.contains("sub sp, sp, #32"));
+        assert!(asm.contains("add sp, sp, #32"));
     }
 
     #[test]
@@ -198,10 +232,10 @@ mod tests {
             ],
             2,
         );
-        assert!(asm.contains("L0:"));
-        assert!(asm.contains("L1:"));
-        assert!(asm.contains("b L0"));
-        assert!(asm.contains("cbz w9, L1"));
+        assert!(asm.contains("Lmain_0:"));
+        assert!(asm.contains("Lmain_1:"));
+        assert!(asm.contains("b Lmain_0"));
+        assert!(asm.contains("cbz w9, Lmain_1"));
     }
 
     #[test]
@@ -217,5 +251,73 @@ mod tests {
         );
         assert!(asm.contains("str w9, [sp, #0]"));
         assert!(asm.contains("ldr w9, [sp, #0]"));
+    }
+
+    #[test]
+    fn codegen_prologue_saves_fp_lr() {
+        let asm = gen(
+            vec![Instr::Const { dst: 0, value: 1 }, Instr::Return { src: 0 }],
+            1,
+        );
+        assert!(asm.contains("stp x29, x30, [sp, #-16]!"));
+        assert!(asm.contains("ldp x29, x30, [sp], #16"));
+    }
+
+    #[test]
+    fn codegen_call_and_loadarg() {
+        let asm = generate(&Program {
+            functions: vec![Function {
+                name: "main".to_string(),
+                body: vec![
+                    Instr::LoadArg { dst: 0, index: 0 },
+                    Instr::Call { dst: 1, name: "puts".to_string(), args: vec![0] },
+                    Instr::Return { src: 1 },
+                ],
+                num_temps: 2,
+            }],
+            strings: vec![],
+        });
+        assert!(asm.contains("str w0, [sp, #0]")); // LoadArg index0 -> slot0
+        assert!(asm.contains("ldr x0, [sp, #0]")); // call arg0 from slot0
+        assert!(asm.contains("bl _puts"));
+    }
+
+    #[test]
+    fn codegen_strlit_section() {
+        let asm = generate(&Program {
+            functions: vec![Function {
+                name: "main".to_string(),
+                body: vec![
+                    Instr::StrLit { dst: 0, index: 0 },
+                    Instr::Return { src: 0 },
+                ],
+                num_temps: 1,
+            }],
+            strings: vec!["Hi".to_string()],
+        });
+        assert!(asm.contains("adrp x9, L_.str.0@PAGE"));
+        assert!(asm.contains("add x9, x9, L_.str.0@PAGEOFF"));
+        assert!(asm.contains("__cstring"));
+        assert!(asm.contains("L_.str.0:"));
+        assert!(asm.contains(".byte 72, 105, 0")); // 'H','i',0
+    }
+
+    #[test]
+    fn codegen_labels_prefixed_by_func() {
+        let asm = generate(&Program {
+            functions: vec![Function {
+                name: "main".to_string(),
+                body: vec![
+                    Instr::Label(0),
+                    Instr::Jump(0),
+                    Instr::Const { dst: 0, value: 0 },
+                    Instr::Return { src: 0 },
+                ],
+                num_temps: 1,
+            }],
+            strings: vec![],
+        });
+        assert!(asm.contains("Lmain_0:"));
+        assert!(asm.contains("b Lmain_0"));
     }
 }
