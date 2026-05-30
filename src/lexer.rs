@@ -21,7 +21,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 line += 1;
                 col = 1;
             }
-            '(' | ')' | '{' | '}' | ';' | '+' | '-' | '*' | '/' | '%' => {
+            '(' | ')' | '{' | '}' | ';' | '+' | '-' | '*' | '/' | '%' | ',' => {
                 let kind = match c {
                     '(' => TokenKind::LParen,
                     ')' => TokenKind::RParen,
@@ -33,11 +33,66 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     '*' => TokenKind::Star,
                     '/' => TokenKind::Slash,
                     '%' => TokenKind::Percent,
+                    ',' => TokenKind::Comma,
                     _ => unreachable!(),
                 };
                 tokens.push(Token { kind, span: Span::new(line, col) });
                 i += 1;
                 col += 1;
+            }
+            '"' => {
+                let start_col = col;
+                i += 1; // 跳过开引号
+                col += 1;
+                let mut s = String::new();
+                loop {
+                    if i >= chars.len() {
+                        return Err(CompileError::new(
+                            Span::new(line, start_col),
+                            "unterminated string literal".to_string(),
+                        ));
+                    }
+                    let ch = chars[i];
+                    if ch == '"' {
+                        i += 1;
+                        col += 1;
+                        break;
+                    } else if ch == '\\' {
+                        i += 1;
+                        col += 1;
+                        if i >= chars.len() {
+                            return Err(CompileError::new(
+                                Span::new(line, start_col),
+                                "unterminated string literal".to_string(),
+                            ));
+                        }
+                        let esc = chars[i];
+                        let mapped = match esc {
+                            'n' => '\n',
+                            't' => '\t',
+                            '\\' => '\\',
+                            '"' => '"',
+                            '0' => '\0',
+                            other => {
+                                return Err(CompileError::new(
+                                    Span::new(line, col),
+                                    format!("unknown escape '\\{}'", other),
+                                ))
+                            }
+                        };
+                        s.push(mapped);
+                        i += 1;
+                        col += 1;
+                    } else {
+                        s.push(ch);
+                        i += 1;
+                        col += 1;
+                    }
+                }
+                tokens.push(Token {
+                    kind: TokenKind::StrLit(s),
+                    span: Span::new(line, start_col),
+                });
             }
             '=' => {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
@@ -188,6 +243,18 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn lex_comma_and_string() {
+        let toks = lex("foo(\"hi\\n\", 1)").unwrap();
+        let ks: Vec<TokenKind> = toks.into_iter().map(|t| t.kind).collect();
+        assert_eq!(ks[0], TokenKind::Ident("foo".to_string()));
+        assert_eq!(ks[1], TokenKind::LParen);
+        assert_eq!(ks[2], TokenKind::StrLit("hi\n".to_string()));
+        assert_eq!(ks[3], TokenKind::Comma);
+        assert_eq!(ks[4], TokenKind::IntLit(1));
+        assert_eq!(ks[5], TokenKind::RParen);
     }
 
     #[test]
