@@ -92,6 +92,11 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             let _ = writeln!(out, "    add x9, sp, #{}", off);
             let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
         }
+        Instr::FieldAddr { dst, base, offset } => {
+            let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*base));
+            let _ = writeln!(out, "    add x9, x9, #{}", offset);
+            let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
         Instr::LoadInd { dst, addr, width, signed } => {
             let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*addr));
             match (*width, *signed) {
@@ -375,6 +380,23 @@ mod tests {
         assert!(asm.contains("ldr w10, [x9]"));
         assert!(asm.contains("ldrsb w10, [x9]"));
         assert!(asm.contains("str x10, [x9]"));
+    }
+
+    #[test]
+    fn codegen_field_addr() {
+        let asm = generate(&Program {
+            functions: vec![Function {
+                name: "main".to_string(),
+                body: vec![
+                    Instr::AddrOf { dst: 0, off: 0 },
+                    Instr::FieldAddr { dst: 8, base: 0, offset: 8 },
+                    Instr::Return { src: 8 },
+                ],
+                frame_bytes: 16,
+            }],
+            strings: vec![],
+        });
+        assert!(asm.contains("add x9, x9, #8"));
     }
 
     #[test]
