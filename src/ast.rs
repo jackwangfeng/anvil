@@ -6,6 +6,7 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncDef {
     pub name: String,
+    pub params: Vec<String>,
     pub body: Vec<Stmt>,
 }
 
@@ -41,6 +42,11 @@ pub enum Stmt {
 pub enum Expr {
     IntLit(i64),
     Var(String),
+    StrLit(String),
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
     Assign {
         name: String,
         value: Box<Expr>,
