@@ -1,5 +1,5 @@
 use crate::ast::{BinaryOp, Expr, FuncDef, Program as AstProgram, Stmt, UnaryOp};
-use crate::types::Type;
+use crate::types::{Aggregates, Type};
 use std::collections::HashMap;
 
 /// 帧内字节偏移（既是临时量，也是变量的存放位置）。
@@ -30,6 +30,7 @@ pub enum Instr {
     StrLit { dst: Temp, index: usize },
     LoadArg { dst: Temp, index: usize, width: usize },
     AddrOf { dst: Temp, off: usize },
+    FieldAddr { dst: Temp, base: Temp, offset: usize },
     LoadInd { dst: Temp, addr: Temp, width: usize, signed: bool },
     StoreInd { addr: Temp, src: Temp, width: usize },
     PtrAdd { dst: Temp, base: Temp, index: Temp, shift: u32 },
@@ -57,7 +58,7 @@ pub fn lower(ast: &AstProgram) -> Program {
     let functions = ast
         .functions
         .iter()
-        .map(|f| lower_func(f, &mut strings))
+        .map(|f| lower_func(f, &mut strings, &ast.aggregates))
         .collect();
     Program { functions, strings }
 }
@@ -68,6 +69,7 @@ struct Lowerer<'a> {
     scopes: Vec<HashMap<String, (usize, Type)>>,
     next_label: usize,
     strings: &'a mut Vec<String>,
+    aggregates: &'a Aggregates,
 }
 
 impl<'a> Lowerer<'a> {
@@ -94,7 +96,7 @@ impl<'a> Lowerer<'a> {
 
     /// 在当前作用域声明变量，按 align8(size) 分配，返回其偏移。
     fn declare_var(&mut self, name: &str, ty: Type) -> usize {
-        let aligned = ty.size().div_ceil(8) * 8;
+        let aligned = self.size_of(&ty).div_ceil(8) * 8;
         let off = self.next_offset;
         self.next_offset += aligned;
         self.scopes
@@ -111,6 +113,25 @@ impl<'a> Lowerer<'a> {
             }
         }
         None
+    }
+
+    fn size_of(&self, ty: &Type) -> usize {
+        crate::types::size_of(ty, self.aggregates)
+    }
+
+    fn field_info(&self, struct_ty: &Type, field: &str) -> (usize, Type) {
+        self.field_info_opt(struct_ty, field)
+            .expect("unknown struct or field")
+    }
+
+    fn field_info_opt(&self, struct_ty: &Type, field: &str) -> Option<(usize, Type)> {
+        let name = match struct_ty {
+            Type::Struct(n) | Type::Union(n) => n,
+            _ => return None,
+        };
+        let agg = self.aggregates.get(name)?;
+        let f = agg.fields.iter().find(|f| f.name == field)?;
+        Some((f.offset, f.ty.clone()))
     }
 
     fn lower_stmt(&mut self, s: &Stmt) {
@@ -233,14 +254,21 @@ impl<'a> Lowerer<'a> {
                         self.body.push(Instr::AddrOf { dst, off });
                         (dst, Type::Pointer(elem))
                     }
+                    Type::Struct(_) | Type::Union(_) => {
+                        // 聚合体不作整体读出，产出其地址（仅作成员访问/取址的基）
+                        let dst = self.fresh();
+                        self.body.push(Instr::AddrOf { dst, off });
+                        (dst, ty)
+                    }
                     scalar => {
                         let addr = self.fresh();
                         self.body.push(Instr::AddrOf { dst: addr, off });
                         let dst = self.fresh();
+                        let width = self.size_of(&scalar);
                         self.body.push(Instr::LoadInd {
                             dst,
                             addr,
-                            width: scalar.size(),
+                            width,
                             signed: matches!(scalar, Type::Char),
                         });
                         (dst, scalar)
@@ -255,10 +283,11 @@ impl<'a> Lowerer<'a> {
                 let (ptr, ty) = self.lower_expr(inner);
                 let pointee = ty.decay().pointee().expect("deref of non-pointer").clone();
                 let dst = self.fresh();
+                let width = self.size_of(&pointee);
                 self.body.push(Instr::LoadInd {
                     dst,
                     addr: ptr,
-                    width: pointee.size(),
+                    width,
                     signed: matches!(pointee, Type::Char),
                 });
                 (dst, pointee)
@@ -266,29 +295,43 @@ impl<'a> Lowerer<'a> {
             Expr::Index { base, index } => {
                 let (ptr, pointee) = self.lower_index_addr(base, index);
                 let dst = self.fresh();
+                let width = self.size_of(&pointee);
                 self.body.push(Instr::LoadInd {
                     dst,
                     addr: ptr,
-                    width: pointee.size(),
+                    width,
                     signed: matches!(pointee, Type::Char),
                 });
                 (dst, pointee)
             }
+            Expr::Member { .. } => {
+                let (addr, ty) = self.lower_lvalue(e);
+                match ty {
+                    Type::Struct(_) | Type::Union(_) | Type::Array(..) => (addr, ty),
+                    scalar => {
+                        let dst = self.fresh();
+                        let width = self.size_of(&scalar);
+                        self.body.push(Instr::LoadInd {
+                            dst,
+                            addr,
+                            width,
+                            signed: matches!(scalar, Type::Char),
+                        });
+                        (dst, scalar)
+                    }
+                }
+            }
             Expr::SizeofType(ty) => {
+                let value = self.size_of(ty) as i64;
                 let dst = self.fresh();
-                self.body.push(Instr::Const {
-                    dst,
-                    value: ty.size() as i64,
-                });
+                self.body.push(Instr::Const { dst, value });
                 (dst, Type::Int)
             }
             Expr::SizeofExpr(inner) => {
                 let ty = self.type_of(inner);
+                let value = self.size_of(&ty) as i64;
                 let dst = self.fresh();
-                self.body.push(Instr::Const {
-                    dst,
-                    value: ty.size() as i64,
-                });
+                self.body.push(Instr::Const { dst, value });
                 (dst, Type::Int)
             }
             Expr::Unary { op, operand } => {
@@ -306,10 +349,11 @@ impl<'a> Lowerer<'a> {
             Expr::Assign { target, value } => {
                 let (v, vty) = self.lower_expr(value);
                 let (addr, ty) = self.lower_lvalue(target);
+                let width = self.size_of(&ty);
                 self.body.push(Instr::StoreInd {
                     addr,
                     src: v,
-                    width: ty.size(),
+                    width,
                 });
                 (v, vty)
             }
@@ -341,6 +385,22 @@ impl<'a> Lowerer<'a> {
                 (ptr, pointee)
             }
             Expr::Index { base, index } => self.lower_index_addr(base, index),
+            Expr::Member { base, field, arrow } => {
+                let (base_addr, struct_ty) = if *arrow {
+                    let (ptr, pty) = self.lower_expr(base);
+                    (ptr, pty.decay().pointee().expect("-> on non-pointer").clone())
+                } else {
+                    self.lower_lvalue(base)
+                };
+                let (offset, fty) = self.field_info(&struct_ty, field);
+                let dst = self.fresh();
+                self.body.push(Instr::FieldAddr {
+                    dst,
+                    base: base_addr,
+                    offset,
+                });
+                (dst, fty)
+            }
             other => panic!("not an lvalue: {:?}", other),
         }
     }
@@ -351,11 +411,12 @@ impl<'a> Lowerer<'a> {
         let elem = pty.decay().pointee().expect("index of non-pointer").clone();
         let (idx, _) = self.lower_expr(index);
         let dst = self.fresh();
+        let shift = shift_of(self.size_of(&elem));
         self.body.push(Instr::PtrAdd {
             dst,
             base: ptr,
             index: idx,
-            shift: shift_of(elem.size()),
+            shift,
         });
         (dst, elem)
     }
@@ -373,7 +434,7 @@ impl<'a> Lowerer<'a> {
             };
             let elem = pty.decay().pointee().unwrap().clone();
             let dst = self.fresh();
-            let shift = shift_of(elem.size());
+            let shift = shift_of(self.size_of(&elem));
             if op == BinaryOp::Add {
                 self.body.push(Instr::PtrAdd {
                     dst,
@@ -428,6 +489,16 @@ impl<'a> Lowerer<'a> {
                 .pointee()
                 .cloned()
                 .unwrap_or(Type::Int),
+            Expr::Member { base, field, arrow } => {
+                let sty = if *arrow {
+                    self.type_of(base).decay().pointee().cloned().unwrap_or(Type::Int)
+                } else {
+                    self.type_of_lvalue(base)
+                };
+                self.field_info_opt(&sty, field)
+                    .map(|(_, t)| t)
+                    .unwrap_or(Type::Int)
+            }
             Expr::Assign { value, .. } => self.type_of(value),
         }
     }
@@ -435,6 +506,16 @@ impl<'a> Lowerer<'a> {
     fn type_of_lvalue(&self, e: &Expr) -> Type {
         match e {
             Expr::Var(name) => self.lookup_var(name).map(|(_, t)| t).unwrap_or(Type::Int),
+            Expr::Member { base, field, arrow } => {
+                let sty = if *arrow {
+                    self.type_of(base).decay().pointee().cloned().unwrap_or(Type::Int)
+                } else {
+                    self.type_of_lvalue(base)
+                };
+                self.field_info_opt(&sty, field)
+                    .map(|(_, t)| t)
+                    .unwrap_or(Type::Int)
+            }
             Expr::Deref(inner) => self
                 .type_of(inner)
                 .decay()
@@ -478,21 +559,23 @@ fn shift_of(size: usize) -> u32 {
     }
 }
 
-fn lower_func(f: &FuncDef, strings: &mut Vec<String>) -> Function {
+fn lower_func(f: &FuncDef, strings: &mut Vec<String>, aggregates: &Aggregates) -> Function {
     let mut lw = Lowerer {
         body: Vec::new(),
         next_offset: 0,
         scopes: vec![HashMap::new()],
         next_label: 0,
         strings,
+        aggregates,
     };
     // 参数占据前若干槽，从入参寄存器直接落到各自槽位。
     for (index, (pname, pty)) in f.params.iter().enumerate() {
+        let width = lw.size_of(pty);
         let off = lw.declare_var(pname, pty.clone());
         lw.body.push(Instr::LoadArg {
             dst: off,
             index,
-            width: pty.size(),
+            width,
         });
     }
     for stmt in &f.body {
@@ -650,5 +733,19 @@ mod tests {
     fn lower_index_uses_ptradd() {
         let f = lower_src("int main(){ int a[4]; return a[2]; }");
         assert!(f.body.iter().any(|i| matches!(i, Instr::PtrAdd { shift: 2, .. })));
+    }
+
+    #[test]
+    fn lower_struct_member_uses_fieldaddr() {
+        let f = lower_src(
+            "struct P { int x; int y; }; int main(){ struct P p; p.y = 7; return p.y; }",
+        );
+        assert!(f.body.iter().any(|i| matches!(i, Instr::FieldAddr { offset: 8, .. })));
+    }
+
+    #[test]
+    fn lower_arrow_member() {
+        let f = lower_src("struct P { int x; }; int main(){ struct P* p; return p->x; }");
+        assert!(f.body.iter().any(|i| matches!(i, Instr::FieldAddr { offset: 0, .. })));
     }
 }

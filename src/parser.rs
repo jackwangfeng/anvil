@@ -1,16 +1,28 @@
 use crate::ast::{BinaryOp, Expr, FuncDef, Program, Stmt, UnaryOp};
 use crate::error::CompileError;
 use crate::token::{Token, TokenKind};
-use crate::types::Type;
+use crate::types::{Aggregate, Aggregates, Field, Type};
+use std::collections::HashMap;
 
 pub fn parse(tokens: &[Token]) -> Result<Program, CompileError> {
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        aggregates: HashMap::new(),
+        typedefs: HashMap::new(),
+        enum_consts: HashMap::new(),
+        anon_counter: 0,
+    };
     p.parse_program()
 }
 
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    aggregates: Aggregates,
+    typedefs: HashMap<String, Type>,
+    enum_consts: HashMap<String, i64>,
+    anon_counter: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -48,20 +60,193 @@ impl<'a> Parser<'a> {
     fn parse_program(&mut self) -> Result<Program, CompileError> {
         let mut functions = Vec::new();
         while *self.peek_kind() != TokenKind::Eof {
-            functions.push(self.parse_func_def()?);
+            match self.peek_kind() {
+                TokenKind::KwStruct | TokenKind::KwUnion => {
+                    self.parse_aggregate_def()?;
+                    self.expect(&TokenKind::Semicolon)?;
+                }
+                TokenKind::KwEnum => {
+                    self.parse_enum_def()?;
+                    self.expect(&TokenKind::Semicolon)?;
+                }
+                TokenKind::KwTypedef => {
+                    self.parse_typedef()?;
+                }
+                _ => functions.push(self.parse_func_def()?),
+            }
         }
-        Ok(Program { functions })
+        Ok(Program {
+            functions,
+            aggregates: self.aggregates.clone(),
+        })
     }
 
-    /// 解析基础类型 + 零个或多个 `*`。返回 None 表示当前不是类型起始。
-    fn try_parse_base_type(&mut self) -> Option<Type> {
-        let base = match self.peek_kind() {
-            TokenKind::KwInt => Type::Int,
-            TokenKind::KwChar => Type::Char,
+    fn size_of(&self, ty: &Type) -> usize {
+        crate::types::size_of(ty, &self.aggregates)
+    }
+
+    fn at_type_start(&self) -> bool {
+        match self.peek_kind() {
+            TokenKind::KwInt
+            | TokenKind::KwChar
+            | TokenKind::KwStruct
+            | TokenKind::KwUnion
+            | TokenKind::KwEnum => true,
+            TokenKind::Ident(name) => self.typedefs.contains_key(name),
+            _ => false,
+        }
+    }
+
+    /// 解析 struct/union 定义，计算布局并注册，返回 tag 名。
+    fn parse_aggregate_def(&mut self) -> Result<String, CompileError> {
+        let is_union = *self.peek_kind() == TokenKind::KwUnion;
+        self.pos += 1; // struct/union
+        let tag = if let TokenKind::Ident(name) = self.peek_kind() {
+            let n = name.clone();
+            self.pos += 1;
+            n
+        } else {
+            let n = format!("__anon_{}", self.anon_counter);
+            self.anon_counter += 1;
+            n
+        };
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        let mut offset = 0usize;
+        let mut max = 0usize;
+        while *self.peek_kind() != TokenKind::RBrace {
+            let fty = self.parse_type_specifier().ok_or_else(|| {
+                CompileError::new(self.tokens[self.pos].span, "expected field type".to_string())
+            })?;
+            let fname = self.expect_ident()?;
+            self.expect(&TokenKind::Semicolon)?;
+            let aligned = self.size_of(&fty).div_ceil(8) * 8;
+            let foff = if is_union { 0 } else { offset };
+            fields.push(Field {
+                name: fname,
+                ty: fty,
+                offset: foff,
+            });
+            if is_union {
+                max = max.max(aligned);
+            } else {
+                offset += aligned;
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        let size = if is_union { max } else { offset };
+        self.aggregates.insert(
+            tag.clone(),
+            Aggregate {
+                fields,
+                size,
+                is_union,
+            },
+        );
+        Ok(tag)
+    }
+
+    fn parse_enum_def(&mut self) -> Result<(), CompileError> {
+        self.expect(&TokenKind::KwEnum)?;
+        if let TokenKind::Ident(_) = self.peek_kind() {
+            self.pos += 1;
+        }
+        self.expect(&TokenKind::LBrace)?;
+        let mut next = 0i64;
+        while *self.peek_kind() != TokenKind::RBrace {
+            let name = self.expect_ident()?;
+            if *self.peek_kind() == TokenKind::Assign {
+                self.pos += 1;
+                if let TokenKind::IntLit(v) = self.peek_kind() {
+                    next = *v;
+                    self.pos += 1;
+                } else {
+                    return Err(CompileError::new(
+                        self.tokens[self.pos].span,
+                        "expected enum value".to_string(),
+                    ));
+                }
+            }
+            self.enum_consts.insert(name, next);
+            next += 1;
+            if *self.peek_kind() == TokenKind::Comma {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(())
+    }
+
+    fn parse_typedef(&mut self) -> Result<(), CompileError> {
+        self.expect(&TokenKind::KwTypedef)?;
+        let ty = self.parse_type_specifier().ok_or_else(|| {
+            CompileError::new(
+                self.tokens[self.pos].span,
+                "expected type in typedef".to_string(),
+            )
+        })?;
+        let name = self.expect_ident()?;
+        self.expect(&TokenKind::Semicolon)?;
+        self.typedefs.insert(name, ty);
+        Ok(())
+    }
+
+    /// 类型说明符：基础类型 / struct|union（含内联定义）/ enum / typedef 名，后跟 `*`。
+    fn parse_type_specifier(&mut self) -> Option<Type> {
+        let mut ty = match self.peek_kind() {
+            TokenKind::KwInt => {
+                self.pos += 1;
+                Type::Int
+            }
+            TokenKind::KwChar => {
+                self.pos += 1;
+                Type::Char
+            }
+            TokenKind::KwStruct | TokenKind::KwUnion => {
+                let save = self.pos;
+                let is_union = *self.peek_kind() == TokenKind::KwUnion;
+                self.pos += 1;
+                let tag = if let TokenKind::Ident(n) = self.peek_kind() {
+                    let n = n.clone();
+                    self.pos += 1;
+                    n
+                } else {
+                    String::new()
+                };
+                if *self.peek_kind() == TokenKind::LBrace {
+                    self.pos = save;
+                    let t = self.parse_aggregate_def().ok()?;
+                    if is_union {
+                        Type::Union(t)
+                    } else {
+                        Type::Struct(t)
+                    }
+                } else if is_union {
+                    Type::Union(tag)
+                } else {
+                    Type::Struct(tag)
+                }
+            }
+            TokenKind::KwEnum => {
+                self.pos += 1;
+                if let TokenKind::Ident(_) = self.peek_kind() {
+                    self.pos += 1;
+                }
+                Type::Int
+            }
+            TokenKind::Ident(name) => {
+                if let Some(t) = self.typedefs.get(name) {
+                    let t = t.clone();
+                    self.pos += 1;
+                    t
+                } else {
+                    return None;
+                }
+            }
             _ => return None,
         };
-        self.pos += 1;
-        let mut ty = base;
         while *self.peek_kind() == TokenKind::Star {
             self.pos += 1;
             ty = Type::Pointer(Box::new(ty));
@@ -76,7 +261,7 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         if *self.peek_kind() != TokenKind::RParen {
             loop {
-                let ty = self.try_parse_base_type().ok_or_else(|| {
+                let ty = self.parse_type_specifier().ok_or_else(|| {
                     CompileError::new(
                         self.tokens[self.pos].span,
                         "expected parameter type".to_string(),
@@ -103,22 +288,23 @@ impl<'a> Parser<'a> {
 
     fn parse_stmt(&mut self) -> Result<Stmt, CompileError> {
         match self.peek_kind() {
-            TokenKind::KwReturn => self.parse_return(),
-            TokenKind::KwInt | TokenKind::KwChar => self.parse_declaration(),
-            TokenKind::KwIf => self.parse_if(),
-            TokenKind::KwWhile => self.parse_while(),
-            TokenKind::KwFor => self.parse_for(),
-            TokenKind::LBrace => self.parse_block(),
+            TokenKind::KwReturn => return self.parse_return(),
+            TokenKind::KwIf => return self.parse_if(),
+            TokenKind::KwWhile => return self.parse_while(),
+            TokenKind::KwFor => return self.parse_for(),
+            TokenKind::LBrace => return self.parse_block(),
             TokenKind::Semicolon => {
                 self.pos += 1;
-                Ok(Stmt::Empty)
+                return Ok(Stmt::Empty);
             }
-            _ => {
-                let e = self.parse_expr()?;
-                self.expect(&TokenKind::Semicolon)?;
-                Ok(Stmt::ExprStmt(e))
-            }
+            _ => {}
         }
+        if self.at_type_start() {
+            return self.parse_declaration();
+        }
+        let e = self.parse_expr()?;
+        self.expect(&TokenKind::Semicolon)?;
+        Ok(Stmt::ExprStmt(e))
     }
 
     fn parse_return(&mut self) -> Result<Stmt, CompileError> {
@@ -130,7 +316,7 @@ impl<'a> Parser<'a> {
 
     fn parse_declaration(&mut self) -> Result<Stmt, CompileError> {
         let mut ty = self
-            .try_parse_base_type()
+            .parse_type_specifier()
             .expect("parse_declaration called without a type");
         let name = self.expect_ident()?;
         // 数组后缀 name[N]
@@ -203,7 +389,7 @@ impl<'a> Parser<'a> {
         let init = if *self.peek_kind() == TokenKind::Semicolon {
             self.pos += 1;
             None
-        } else if matches!(self.peek_kind(), TokenKind::KwInt | TokenKind::KwChar) {
+        } else if self.at_type_start() {
             Some(Box::new(self.parse_declaration()?)) // 自带分号消费
         } else {
             let e = self.parse_expr()?;
@@ -241,10 +427,12 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let value = self.parse_assign()?; // 右结合
             match &lhs {
-                Expr::Var(_) | Expr::Deref(_) | Expr::Index { .. } => Ok(Expr::Assign {
-                    target: Box::new(lhs),
-                    value: Box::new(value),
-                }),
+                Expr::Var(_) | Expr::Deref(_) | Expr::Index { .. } | Expr::Member { .. } => {
+                    Ok(Expr::Assign {
+                        target: Box::new(lhs),
+                        value: Box::new(value),
+                    })
+                }
                 _ => Err(CompileError::new(
                     self.tokens[self.pos.saturating_sub(1)].span,
                     "invalid assignment target".to_string(),
@@ -300,7 +488,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwSizeof => {
                 self.pos += 1;
                 self.expect(&TokenKind::LParen)?;
-                if let Some(ty) = self.try_parse_base_type() {
+                if let Some(ty) = self.parse_type_specifier() {
                     self.expect(&TokenKind::RParen)?;
                     Ok(Expr::SizeofType(ty))
                 } else {
@@ -313,17 +501,40 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// primary 后跟零个或多个下标 `[expr]`。
+    /// primary 后跟零个或多个后缀：下标 `[expr]`、成员 `.field`、`->field`。
     fn parse_postfix(&mut self) -> Result<Expr, CompileError> {
         let mut e = self.parse_primary()?;
-        while *self.peek_kind() == TokenKind::LBracket {
-            self.pos += 1;
-            let index = self.parse_expr()?;
-            self.expect(&TokenKind::RBracket)?;
-            e = Expr::Index {
-                base: Box::new(e),
-                index: Box::new(index),
-            };
+        loop {
+            match self.peek_kind() {
+                TokenKind::LBracket => {
+                    self.pos += 1;
+                    let index = self.parse_expr()?;
+                    self.expect(&TokenKind::RBracket)?;
+                    e = Expr::Index {
+                        base: Box::new(e),
+                        index: Box::new(index),
+                    };
+                }
+                TokenKind::Dot => {
+                    self.pos += 1;
+                    let field = self.expect_ident()?;
+                    e = Expr::Member {
+                        base: Box::new(e),
+                        field,
+                        arrow: false,
+                    };
+                }
+                TokenKind::Arrow => {
+                    self.pos += 1;
+                    let field = self.expect_ident()?;
+                    e = Expr::Member {
+                        base: Box::new(e),
+                        field,
+                        arrow: true,
+                    };
+                }
+                _ => break,
+            }
         }
         Ok(e)
     }
@@ -359,6 +570,8 @@ impl<'a> Parser<'a> {
                     }
                     self.expect(&TokenKind::RParen)?;
                     Ok(Expr::Call { name, args })
+                } else if let Some(v) = self.enum_consts.get(&name) {
+                    Ok(Expr::IntLit(*v))
                 } else {
                     Ok(Expr::Var(name))
                 }
@@ -428,6 +641,48 @@ mod tests {
             f.params,
             vec![("a".to_string(), Type::Int), ("b".to_string(), Type::Int)]
         );
+    }
+
+    #[test]
+    fn parse_struct_def_and_member() {
+        let prog = parse(
+            &lex("struct P { int x; int y; }; int main(){ struct P p; p.x = 3; return p.x; }")
+                .unwrap(),
+        )
+        .unwrap();
+        let agg = prog.aggregates.get("P").unwrap();
+        assert_eq!(agg.fields.len(), 2);
+        assert_eq!(agg.fields[0].name, "x");
+        assert_eq!(agg.fields[1].offset, 8);
+    }
+
+    #[test]
+    fn parse_arrow_member() {
+        let e = parse_return_expr("int main(){ return p->x; }");
+        assert_eq!(
+            e,
+            Expr::Member {
+                base: Box::new(Expr::Var("p".into())),
+                field: "x".into(),
+                arrow: true
+            }
+        );
+    }
+
+    #[test]
+    fn parse_enum_constants() {
+        let e = parse_return_expr("enum E { A, B, C }; int main(){ return B; }");
+        assert_eq!(e, Expr::IntLit(1));
+    }
+
+    #[test]
+    fn parse_typedef_alias() {
+        let prog = parse(&lex("typedef int MyInt; int main(){ MyInt x; x = 7; return x; }").unwrap())
+            .unwrap();
+        match &prog.functions[0].body[0] {
+            Stmt::Declare { ty, .. } => assert_eq!(*ty, Type::Int),
+            other => panic!("{:?}", other),
+        }
     }
 
     #[test]

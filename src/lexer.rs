@@ -21,8 +21,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 line += 1;
                 col = 1;
             }
-            '(' | ')' | '{' | '}' | ';' | '+' | '-' | '*' | '/' | '%' | ',' | '&' | '['
-            | ']' => {
+            '(' | ')' | '{' | '}' | ';' | '+' | '*' | '/' | '%' | ',' | '&' | '[' | ']'
+            | '.' => {
                 let kind = match c {
                     '(' => TokenKind::LParen,
                     ')' => TokenKind::RParen,
@@ -30,7 +30,6 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     '}' => TokenKind::RBrace,
                     ';' => TokenKind::Semicolon,
                     '+' => TokenKind::Plus,
-                    '-' => TokenKind::Minus,
                     '*' => TokenKind::Star,
                     '/' => TokenKind::Slash,
                     '%' => TokenKind::Percent,
@@ -38,11 +37,23 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     '&' => TokenKind::Amp,
                     '[' => TokenKind::LBracket,
                     ']' => TokenKind::RBracket,
+                    '.' => TokenKind::Dot,
                     _ => unreachable!(),
                 };
                 tokens.push(Token { kind, span: Span::new(line, col) });
                 i += 1;
                 col += 1;
+            }
+            '-' => {
+                if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    tokens.push(Token { kind: TokenKind::Arrow, span: Span::new(line, col) });
+                    i += 2;
+                    col += 2;
+                } else {
+                    tokens.push(Token { kind: TokenKind::Minus, span: Span::new(line, col) });
+                    i += 1;
+                    col += 1;
+                }
             }
             '"' => {
                 let start_col = col;
@@ -179,6 +190,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     "for" => TokenKind::KwFor,
                     "char" => TokenKind::KwChar,
                     "sizeof" => TokenKind::KwSizeof,
+                    "struct" => TokenKind::KwStruct,
+                    "union" => TokenKind::KwUnion,
+                    "enum" => TokenKind::KwEnum,
+                    "typedef" => TokenKind::KwTypedef,
                     _ => TokenKind::Ident(ident),
                 };
                 tokens.push(Token { kind, span: Span::new(line, start_col) });
@@ -246,6 +261,22 @@ mod tests {
                 TokenKind::Star,
                 TokenKind::Slash,
                 TokenKind::Percent,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_m5_tokens() {
+        assert_eq!(
+            kinds(". -> struct union enum typedef"),
+            vec![
+                TokenKind::Dot,
+                TokenKind::Arrow,
+                TokenKind::KwStruct,
+                TokenKind::KwUnion,
+                TokenKind::KwEnum,
+                TokenKind::KwTypedef,
                 TokenKind::Eof,
             ]
         );

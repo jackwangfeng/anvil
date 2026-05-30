@@ -226,3 +226,51 @@ fn m4_pointer_param() {
         9
     );
 }
+
+#[test]
+fn m5_struct_members() {
+    assert_eq!(
+        compile_and_run("struct P { int x; int y; }; int main(){ struct P p; p.x=40; p.y=2; return p.x+p.y; }", "m5_struct"),
+        42
+    );
+}
+
+#[test]
+fn m5_struct_pointer_arrow() {
+    assert_eq!(
+        compile_and_run("struct P { int x; int y; }; int gy(struct P* q){ return q->y; } int main(){ struct P p; p.y=7; return gy(&p); }", "m5_arrow"),
+        7
+    );
+}
+
+#[test]
+fn m5_nested_struct() {
+    assert_eq!(
+        compile_and_run("struct I { int v; }; struct O { int a; struct I in; }; int main(){ struct O o; o.in.v=9; return o.in.v; }", "m5_nested"),
+        9
+    );
+}
+
+#[test]
+fn m5_enum() {
+    assert_eq!(
+        compile_and_run("enum E { A, B=5, C }; int main(){ return A + B + C; }", "m5_enum"),
+        11
+    );
+}
+
+#[test]
+fn m5_typedef_struct() {
+    assert_eq!(
+        compile_and_run("typedef struct { int x; int y; } Pt; int main(){ Pt p; p.x=10; p.y=32; return p.x+p.y; }", "m5_typedef"),
+        42
+    );
+}
+
+#[test]
+fn m5_union() {
+    assert_eq!(
+        compile_and_run("union U { int i; char c; }; int main(){ union U u; u.i=65; return u.c; }", "m5_union"),
+        65
+    );
+}

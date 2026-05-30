@@ -21,6 +21,8 @@ pub enum TokenKind {
     Amp,
     LBracket,
     RBracket,
+    Dot,
+    Arrow,
     Assign,
     Lt,
     Gt,
@@ -34,6 +36,10 @@ pub enum TokenKind {
     KwFor,
     KwChar,
     KwSizeof,
+    KwStruct,
+    KwUnion,
+    KwEnum,
+    KwTypedef,
     Eof,
 }
 
