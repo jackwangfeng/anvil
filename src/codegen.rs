@@ -45,6 +45,28 @@ fn gen_instr(instr: &Instr, frame: usize, out: &mut String) {
             out.push_str("    neg w9, w9\n");
             let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
         }
+        Instr::Load { dst, var } => {
+            let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*var));
+            let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
+        }
+        Instr::Store { var, src } => {
+            let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*src));
+            let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*var));
+        }
+        Instr::Copy { dst, src } => {
+            let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*src));
+            let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
+        }
+        Instr::Label(n) => {
+            let _ = writeln!(out, "L{}:", n);
+        }
+        Instr::Jump(n) => {
+            let _ = writeln!(out, "    b L{}", n);
+        }
+        Instr::JumpIfZero { cond, target } => {
+            let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*cond));
+            let _ = writeln!(out, "    cbz w9, L{}", target);
+        }
         Instr::Bin { dst, op, lhs, rhs } => {
             let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*lhs));
             let _ = writeln!(out, "    ldr w10, [sp, #{}]", slot(*rhs));
@@ -58,6 +80,12 @@ fn gen_instr(instr: &Instr, frame: usize, out: &mut String) {
                     out.push_str("    sdiv w11, w9, w10\n");
                     out.push_str("    msub w9, w11, w10, w9\n");
                 }
+                BinOp::Lt => out.push_str("    cmp w9, w10\n    cset w9, lt\n"),
+                BinOp::Gt => out.push_str("    cmp w9, w10\n    cset w9, gt\n"),
+                BinOp::Le => out.push_str("    cmp w9, w10\n    cset w9, le\n"),
+                BinOp::Ge => out.push_str("    cmp w9, w10\n    cset w9, ge\n"),
+                BinOp::Eq => out.push_str("    cmp w9, w10\n    cset w9, eq\n"),
+                BinOp::Ne => out.push_str("    cmp w9, w10\n    cset w9, ne\n"),
             }
             let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
         }
@@ -139,5 +167,55 @@ mod tests {
         );
         assert!(asm.contains("sdiv w11, w9, w10"));
         assert!(asm.contains("msub w9, w11, w10, w9"));
+    }
+
+    #[test]
+    fn codegen_compare_uses_cset() {
+        let asm = gen(
+            vec![
+                Instr::Const { dst: 0, value: 1 },
+                Instr::Const { dst: 1, value: 2 },
+                Instr::Bin { dst: 2, op: BinOp::Lt, lhs: 0, rhs: 1 },
+                Instr::Return { src: 2 },
+            ],
+            3,
+        );
+        assert!(asm.contains("cmp w9, w10"));
+        assert!(asm.contains("cset w9, lt"));
+    }
+
+    #[test]
+    fn codegen_control_flow() {
+        let asm = gen(
+            vec![
+                Instr::Label(0),
+                Instr::Const { dst: 0, value: 0 },
+                Instr::JumpIfZero { cond: 0, target: 1 },
+                Instr::Jump(0),
+                Instr::Label(1),
+                Instr::Const { dst: 1, value: 7 },
+                Instr::Return { src: 1 },
+            ],
+            2,
+        );
+        assert!(asm.contains("L0:"));
+        assert!(asm.contains("L1:"));
+        assert!(asm.contains("b L0"));
+        assert!(asm.contains("cbz w9, L1"));
+    }
+
+    #[test]
+    fn codegen_load_store_roundtrip() {
+        let asm = gen(
+            vec![
+                Instr::Const { dst: 1, value: 9 },
+                Instr::Store { var: 0, src: 1 },
+                Instr::Load { dst: 2, var: 0 },
+                Instr::Return { src: 2 },
+            ],
+            3,
+        );
+        assert!(asm.contains("str w9, [sp, #0]"));
+        assert!(asm.contains("ldr w9, [sp, #0]"));
     }
 }
