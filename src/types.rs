@@ -1,9 +1,13 @@
+use std::collections::HashMap;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     Int,
     Char,
     Pointer(Box<Type>),
     Array(Box<Type>, usize),
+    Struct(String),
+    Union(String),
 }
 
 impl Type {
@@ -13,6 +17,9 @@ impl Type {
             Type::Char => 1,
             Type::Pointer(_) => 8,
             Type::Array(elem, n) => elem.size() * n,
+            Type::Struct(_) | Type::Union(_) => {
+                unreachable!("use size_of with registry for aggregates")
+            }
         }
     }
 
@@ -37,6 +44,31 @@ impl Type {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field {
+    pub name: String,
+    pub ty: Type,
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Aggregate {
+    pub fields: Vec<Field>,
+    pub size: usize,
+    pub is_union: bool,
+}
+
+pub type Aggregates = HashMap<String, Aggregate>;
+
+/// 带聚合体注册表的大小计算。
+pub fn size_of(ty: &Type, aggs: &Aggregates) -> usize {
+    match ty {
+        Type::Struct(name) | Type::Union(name) => aggs.get(name).map(|a| a.size).unwrap_or(0),
+        Type::Array(elem, n) => size_of(elem, aggs) * n,
+        other => other.size(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,6 +79,28 @@ mod tests {
         assert_eq!(Type::Char.size(), 1);
         assert_eq!(Type::Pointer(Box::new(Type::Int)).size(), 8);
         assert_eq!(Type::Array(Box::new(Type::Int), 10).size(), 40);
+    }
+
+    #[test]
+    fn struct_layout_size() {
+        let mut aggs: Aggregates = std::collections::HashMap::new();
+        aggs.insert(
+            "P".to_string(),
+            Aggregate {
+                fields: vec![
+                    Field { name: "x".into(), ty: Type::Int, offset: 0 },
+                    Field { name: "y".into(), ty: Type::Int, offset: 8 },
+                ],
+                size: 16,
+                is_union: false,
+            },
+        );
+        assert_eq!(size_of(&Type::Struct("P".into()), &aggs), 16);
+        assert_eq!(
+            size_of(&Type::Pointer(Box::new(Type::Struct("P".into()))), &aggs),
+            8
+        );
+        assert_eq!(size_of(&Type::Int, &aggs), 4);
     }
 
     #[test]
