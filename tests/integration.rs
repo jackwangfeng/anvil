@@ -494,3 +494,40 @@ fn m10_realistic_program() {
     assert_eq!(code, 15);
     assert_eq!(out, "OK 15\n");
 }
+
+#[test]
+fn m11_double_arithmetic() {
+    // 3.5 + 2.0 = 5.5, 截断为 int = 5
+    assert_eq!(compile_and_run("int main(){ double x=3.5; double y=2.0; return x+y; }", "m11_dadd"), 5);
+    assert_eq!(compile_and_run("int main(){ return 3.0 * 4.0; }", "m11_dmul"), 12);
+}
+
+#[test]
+fn m11_double_compare() {
+    assert_eq!(compile_and_run("int main(){ return 7.0 / 2.0 > 3.0; }", "m11_dcmp"), 1);
+}
+
+#[test]
+fn m11_int_double_promote() {
+    assert_eq!(compile_and_run("int main(){ int n=5; double h = n / 2.0; return h > 2.0; }", "m11_promote"), 1);
+}
+
+#[test]
+fn m11_printf_float() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ printf(\"pi=%f\\n\", 3.14159); return 0; }",
+        "m11_pf",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "pi=3.141590\n");
+}
+
+#[test]
+fn m11_double_return() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\ndouble half(int x){ return x / 2.0; }\nint main(){ double h = half(9); printf(\"%f\\n\", h); return h > 4.0; }",
+        "m11_dret",
+    );
+    assert_eq!(code, 1);
+    assert_eq!(out, "4.500000\n");
+}

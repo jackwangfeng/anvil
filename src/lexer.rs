@@ -287,16 +287,38 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     i += 1;
                     col += 1;
                 }
-                let value: i64 = num.parse().map_err(|_| {
-                    CompileError::new(
-                        Span::new(line, start_col),
-                        format!("invalid integer literal '{}'", num),
-                    )
-                })?;
-                tokens.push(Token {
-                    kind: TokenKind::IntLit(value),
-                    span: Span::new(line, start_col),
-                });
+                // 浮点字面量：小数点后跟数字
+                if i + 1 < chars.len() && chars[i] == '.' && chars[i + 1].is_ascii_digit() {
+                    num.push('.');
+                    i += 1;
+                    col += 1;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        num.push(chars[i]);
+                        i += 1;
+                        col += 1;
+                    }
+                    let value: f64 = num.parse().map_err(|_| {
+                        CompileError::new(
+                            Span::new(line, start_col),
+                            format!("invalid float literal '{}'", num),
+                        )
+                    })?;
+                    tokens.push(Token {
+                        kind: TokenKind::FloatLit(value),
+                        span: Span::new(line, start_col),
+                    });
+                } else {
+                    let value: i64 = num.parse().map_err(|_| {
+                        CompileError::new(
+                            Span::new(line, start_col),
+                            format!("invalid integer literal '{}'", num),
+                        )
+                    })?;
+                    tokens.push(Token {
+                        kind: TokenKind::IntLit(value),
+                        span: Span::new(line, start_col),
+                    });
+                }
             }
             c if c.is_alphabetic() || c == '_' => {
                 let start_col = col;
@@ -326,6 +348,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     "switch" => TokenKind::KwSwitch,
                     "case" => TokenKind::KwCase,
                     "default" => TokenKind::KwDefault,
+                    "double" | "float" => TokenKind::KwDouble,
                     _ => TokenKind::Ident(ident),
                 };
                 tokens.push(Token { kind, span: Span::new(line, start_col) });

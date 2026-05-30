@@ -9,7 +9,27 @@ pub fn generate(program: &Program) -> String {
     }
     gen_strings(&program.strings, &mut out);
     gen_globals(&program.globals, &mut out);
+    gen_floats(&program.floats, &mut out);
     out
+}
+
+fn is_compare_binop(op: &BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::Eq | BinOp::Ne
+    )
+}
+
+fn gen_floats(floats: &[u64], out: &mut String) {
+    if floats.is_empty() {
+        return;
+    }
+    out.push_str(".section __TEXT,__const\n");
+    out.push_str(".p2align 3\n");
+    for (i, bits) in floats.iter().enumerate() {
+        let _ = writeln!(out, "Lfloat.{}:", i);
+        let _ = writeln!(out, "    .quad {}", bits);
+    }
 }
 
 fn gen_globals(globals: &[crate::ir::GlobalVar], out: &mut String) {
@@ -189,7 +209,7 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             let _ = writeln!(out, "    sub x9, x9, w10, sxtw #{}", shift);
             let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
         }
-        Instr::Call { dst, name, args, ret_width, fixed, variadic } => {
+        Instr::Call { dst, name, args, ret_width, fixed, variadic, ret_float } => {
             // 寄存器可容纳的参数数：可变参数函数下，仅固定参数进寄存器（≤8）；否则前 8 个进寄存器。
             let nreg = if *variadic { (*fixed).min(8) } else { args.len().min(8) };
             let stack_args = &args[nreg..];
@@ -210,7 +230,9 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             if space > 0 {
                 let _ = writeln!(out, "    add sp, sp, #{}", space);
             }
-            if *ret_width == 8 {
+            if *ret_float {
+                let _ = writeln!(out, "    str d0, [sp, #{}]", slot(*dst));
+            } else if *ret_width == 8 {
                 let _ = writeln!(out, "    str x0, [sp, #{}]", slot(*dst));
             } else {
                 let _ = writeln!(out, "    str w0, [sp, #{}]", slot(*dst));
@@ -242,13 +264,59 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             }
             let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
         }
-        Instr::Return { src } => {
-            let _ = writeln!(out, "    ldr w0, [sp, #{}]", slot(*src));
+        Instr::Return { src, is_float, width } => {
+            if *is_float {
+                let _ = writeln!(out, "    ldr d0, [sp, #{}]", slot(*src));
+            } else if *width == 8 {
+                let _ = writeln!(out, "    ldr x0, [sp, #{}]", slot(*src));
+            } else {
+                let _ = writeln!(out, "    ldr w0, [sp, #{}]", slot(*src));
+            }
             if frame > 0 {
                 let _ = writeln!(out, "    add sp, sp, #{}", frame);
             }
             out.push_str("    ldp x29, x30, [sp], #16\n");
             out.push_str("    ret\n");
+        }
+        Instr::ConstF { dst, index } => {
+            // 从浮点常量池按位载入（不需 FP 寄存器，纯 8 字节位拷贝）
+            let _ = writeln!(out, "    adrp x9, Lfloat.{}@PAGE", index);
+            let _ = writeln!(out, "    add x9, x9, Lfloat.{}@PAGEOFF", index);
+            out.push_str("    ldr x9, [x9]\n");
+            let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
+        Instr::BinF { dst, op, lhs, rhs } => {
+            let _ = writeln!(out, "    ldr d0, [sp, #{}]", slot(*lhs));
+            let _ = writeln!(out, "    ldr d1, [sp, #{}]", slot(*rhs));
+            match op {
+                BinOp::Add => out.push_str("    fadd d0, d0, d1\n"),
+                BinOp::Sub => out.push_str("    fsub d0, d0, d1\n"),
+                BinOp::Mul => out.push_str("    fmul d0, d0, d1\n"),
+                BinOp::Div => out.push_str("    fdiv d0, d0, d1\n"),
+                BinOp::Lt => out.push_str("    fcmp d0, d1\n    cset w9, lt\n"),
+                BinOp::Gt => out.push_str("    fcmp d0, d1\n    cset w9, gt\n"),
+                BinOp::Le => out.push_str("    fcmp d0, d1\n    cset w9, le\n"),
+                BinOp::Ge => out.push_str("    fcmp d0, d1\n    cset w9, ge\n"),
+                BinOp::Eq => out.push_str("    fcmp d0, d1\n    cset w9, eq\n"),
+                BinOp::Ne => out.push_str("    fcmp d0, d1\n    cset w9, ne\n"),
+                _ => {} // 浮点不支持 mod/位运算
+            }
+            // 比较结果在 w9（int），算术结果在 d0（double）
+            if is_compare_binop(op) {
+                let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
+            } else {
+                let _ = writeln!(out, "    str d0, [sp, #{}]", slot(*dst));
+            }
+        }
+        Instr::IntToFloat { dst, src } => {
+            let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*src));
+            out.push_str("    scvtf d0, w9\n");
+            let _ = writeln!(out, "    str d0, [sp, #{}]", slot(*dst));
+        }
+        Instr::FloatToInt { dst, src } => {
+            let _ = writeln!(out, "    ldr d0, [sp, #{}]", slot(*src));
+            out.push_str("    fcvtzs w9, d0\n");
+            let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
         }
     }
 }
@@ -278,13 +346,14 @@ mod tests {
             }],
             strings: vec![],
             globals: vec![],
+            floats: vec![],
         })
     }
 
     #[test]
     fn codegen_const_return() {
         let asm = gen(
-            vec![Instr::Const { dst: 0, value: 42 }, Instr::Return { src: 0 }],
+            vec![Instr::Const { dst: 0, value: 42 }, Instr::Return { src: 0, is_float: false, width: 4 }],
             8,
         );
         assert!(asm.contains(".globl _main"));
@@ -300,7 +369,7 @@ mod tests {
                 Instr::Const { dst: 0, value: 1 },
                 Instr::Const { dst: 8, value: 2 },
                 Instr::Bin { dst: 16, op: BinOp::Add, lhs: 0, rhs: 8 },
-                Instr::Return { src: 16 },
+                Instr::Return { src: 16, is_float: false, width: 4 },
             ],
             24,
         );
@@ -316,7 +385,7 @@ mod tests {
                 Instr::Const { dst: 0, value: 17 },
                 Instr::Const { dst: 8, value: 5 },
                 Instr::Bin { dst: 16, op: BinOp::Mod, lhs: 0, rhs: 8 },
-                Instr::Return { src: 16 },
+                Instr::Return { src: 16, is_float: false, width: 4 },
             ],
             24,
         );
@@ -331,7 +400,7 @@ mod tests {
                 Instr::Const { dst: 0, value: 1 },
                 Instr::Const { dst: 8, value: 2 },
                 Instr::Bin { dst: 16, op: BinOp::Lt, lhs: 0, rhs: 8 },
-                Instr::Return { src: 16 },
+                Instr::Return { src: 16, is_float: false, width: 4 },
             ],
             24,
         );
@@ -349,7 +418,7 @@ mod tests {
                 Instr::Jump(0),
                 Instr::Label(1),
                 Instr::Const { dst: 8, value: 7 },
-                Instr::Return { src: 8 },
+                Instr::Return { src: 8, is_float: false, width: 4 },
             ],
             16,
         );
@@ -362,7 +431,7 @@ mod tests {
     #[test]
     fn codegen_prologue_saves_fp_lr() {
         let asm = gen(
-            vec![Instr::Const { dst: 0, value: 1 }, Instr::Return { src: 0 }],
+            vec![Instr::Const { dst: 0, value: 1 }, Instr::Return { src: 0, is_float: false, width: 4 }],
             8,
         );
         assert!(asm.contains("stp x29, x30, [sp, #-16]!"));
@@ -383,13 +452,15 @@ mod tests {
                         ret_width: 4,
                         fixed: 1,
                         variadic: false,
+                        ret_float: false,
                     },
-                    Instr::Return { src: 8 },
+                    Instr::Return { src: 8, is_float: false, width: 4 },
                 ],
                 frame_bytes: 16,
             }],
             strings: vec![],
             globals: vec![],
+            floats: vec![],
         });
         assert!(asm.contains("str w0, [sp, #0]"));
         assert!(asm.contains("ldr x0, [sp, #0]"));
@@ -403,12 +474,13 @@ mod tests {
                 name: "main".to_string(),
                 body: vec![
                     Instr::StrLit { dst: 0, index: 0 },
-                    Instr::Return { src: 0 },
+                    Instr::Return { src: 0, is_float: false, width: 4 },
                 ],
                 frame_bytes: 8,
             }],
             strings: vec!["Hi".to_string()],
             globals: vec![],
+            floats: vec![],
         });
         assert!(asm.contains("adrp x9, L_.str.0@PAGE"));
         assert!(asm.contains("add x9, x9, L_.str.0@PAGEOFF"));
@@ -426,12 +498,13 @@ mod tests {
                     Instr::Label(0),
                     Instr::Jump(0),
                     Instr::Const { dst: 0, value: 0 },
-                    Instr::Return { src: 0 },
+                    Instr::Return { src: 0, is_float: false, width: 4 },
                 ],
                 frame_bytes: 8,
             }],
             strings: vec![],
             globals: vec![],
+            floats: vec![],
         });
         assert!(asm.contains("Lmain_0:"));
         assert!(asm.contains("b Lmain_0"));
@@ -442,11 +515,12 @@ mod tests {
         let asm = generate(&Program {
             functions: vec![Function {
                 name: "main".to_string(),
-                body: vec![Instr::AddrOf { dst: 8, off: 0 }, Instr::Return { src: 8 }],
+                body: vec![Instr::AddrOf { dst: 8, off: 0 }, Instr::Return { src: 8, is_float: false, width: 4 }],
                 frame_bytes: 16,
             }],
             strings: vec![],
             globals: vec![],
+            floats: vec![],
         });
         assert!(asm.contains("add x9, sp, #0"));
         assert!(asm.contains("str x9, [sp, #8]"));
@@ -461,12 +535,13 @@ mod tests {
                     Instr::LoadInd { dst: 8, addr: 0, width: 4, signed: false },
                     Instr::LoadInd { dst: 16, addr: 0, width: 1, signed: true },
                     Instr::StoreInd { addr: 0, src: 8, width: 8 },
-                    Instr::Return { src: 8 },
+                    Instr::Return { src: 8, is_float: false, width: 4 },
                 ],
                 frame_bytes: 24,
             }],
             strings: vec![],
             globals: vec![],
+            floats: vec![],
         });
         assert!(asm.contains("ldr w10, [x9]"));
         assert!(asm.contains("ldrsb w10, [x9]"));
@@ -481,12 +556,13 @@ mod tests {
                 body: vec![
                     Instr::AddrOf { dst: 0, off: 0 },
                     Instr::FieldAddr { dst: 8, base: 0, offset: 8 },
-                    Instr::Return { src: 8 },
+                    Instr::Return { src: 8, is_float: false, width: 4 },
                 ],
                 frame_bytes: 16,
             }],
             strings: vec![],
             globals: vec![],
+            floats: vec![],
         });
         assert!(asm.contains("add x9, x9, #8"));
     }
@@ -498,12 +574,13 @@ mod tests {
                 name: "main".to_string(),
                 body: vec![
                     Instr::PtrAdd { dst: 16, base: 0, index: 8, shift: 2 },
-                    Instr::Return { src: 16 },
+                    Instr::Return { src: 16, is_float: false, width: 4 },
                 ],
                 frame_bytes: 24,
             }],
             strings: vec![],
             globals: vec![],
+            floats: vec![],
         });
         assert!(asm.contains("add x9, x9, w10, sxtw #2"));
     }

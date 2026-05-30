@@ -5,6 +5,7 @@ pub enum Type {
     Void,
     Int,
     Char,
+    Double,
     Pointer(Box<Type>),
     Array(Box<Type>, usize),
     Struct(String),
@@ -17,6 +18,7 @@ impl Type {
             Type::Void => 0,
             Type::Int => 4,
             Type::Char => 1,
+            Type::Double => 8,
             Type::Pointer(_) => 8,
             Type::Array(elem, n) => elem.size() * n,
             Type::Struct(_) | Type::Union(_) => {

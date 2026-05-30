@@ -10,6 +10,7 @@ pub struct Program {
     pub functions: Vec<Function>,
     pub strings: Vec<String>,
     pub globals: Vec<GlobalVar>,
+    pub floats: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,25 @@ pub enum Instr {
         ret_width: usize,
         fixed: usize,
         variadic: bool,
+        ret_float: bool,
+    },
+    ConstF {
+        dst: Temp,
+        index: usize,
+    },
+    BinF {
+        dst: Temp,
+        op: BinOp,
+        lhs: Temp,
+        rhs: Temp,
+    },
+    IntToFloat {
+        dst: Temp,
+        src: Temp,
+    },
+    FloatToInt {
+        dst: Temp,
+        src: Temp,
     },
     StrLit { dst: Temp, index: usize },
     LoadArg { dst: Temp, index: usize, width: usize },
@@ -52,7 +72,7 @@ pub enum Instr {
     StoreInd { addr: Temp, src: Temp, width: usize },
     PtrAdd { dst: Temp, base: Temp, index: Temp, shift: u32 },
     PtrSub { dst: Temp, base: Temp, index: Temp, shift: u32 },
-    Return { src: Temp },
+    Return { src: Temp, is_float: bool, width: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +97,7 @@ pub enum BinOp {
 
 pub fn lower(ast: &AstProgram) -> Program {
     let mut strings = Vec::new();
+    let mut floats = Vec::new();
     let global_types: HashMap<String, Type> = ast
         .globals
         .iter()
@@ -85,7 +106,16 @@ pub fn lower(ast: &AstProgram) -> Program {
     let functions = ast
         .functions
         .iter()
-        .map(|f| lower_func(f, &mut strings, &ast.aggregates, &ast.signatures, &global_types))
+        .map(|f| {
+            lower_func(
+                f,
+                &mut strings,
+                &mut floats,
+                &ast.aggregates,
+                &ast.signatures,
+                &global_types,
+            )
+        })
         .collect();
     let globals = ast
         .globals
@@ -100,6 +130,7 @@ pub fn lower(ast: &AstProgram) -> Program {
         functions,
         strings,
         globals,
+        floats,
     }
 }
 
@@ -109,9 +140,11 @@ struct Lowerer<'a> {
     scopes: Vec<HashMap<String, (usize, Type)>>,
     next_label: usize,
     strings: &'a mut Vec<String>,
+    floats: &'a mut Vec<u64>,
     aggregates: &'a Aggregates,
     signatures: &'a Signatures,
     globals: &'a HashMap<String, Type>,
+    ret_ty: Type,
     break_targets: Vec<usize>,
     continue_targets: Vec<usize>,
 }
@@ -163,6 +196,23 @@ impl<'a> Lowerer<'a> {
         crate::types::size_of(ty, self.aggregates)
     }
 
+    /// 在 int 与 double 之间按需插入转换指令，返回结果临时量。
+    fn coerce(&mut self, t: Temp, from: &Type, to: &Type) -> Temp {
+        let from_f = matches!(from, Type::Double);
+        let to_f = matches!(to, Type::Double);
+        if from_f && !to_f {
+            let dst = self.fresh();
+            self.body.push(Instr::FloatToInt { dst, src: t });
+            dst
+        } else if !from_f && to_f {
+            let dst = self.fresh();
+            self.body.push(Instr::IntToFloat { dst, src: t });
+            dst
+        } else {
+            t
+        }
+    }
+
     /// 取变量地址：局部用 AddrOf，全局用 GlobalAddr。返回 (地址临时量, 变量类型)。
     fn var_addr(&mut self, name: &str) -> (Temp, Type) {
         if let Some((off, ty)) = self.lookup_var(name) {
@@ -205,20 +255,24 @@ impl<'a> Lowerer<'a> {
     fn lower_stmt(&mut self, s: &Stmt) {
         match s {
             Stmt::Return(e) => {
-                let (src, _) = self.lower_expr(e);
-                self.body.push(Instr::Return { src });
+                let (v, ety) = self.lower_expr(e);
+                let ret_ty = self.ret_ty.clone();
+                let src = self.coerce(v, &ety, &ret_ty);
+                self.body.push(Instr::Return {
+                    src,
+                    is_float: matches!(ret_ty, Type::Double),
+                    width: if matches!(ret_ty, Type::Pointer(_)) { 8 } else { 4 },
+                });
             }
             Stmt::Declare { name, ty, init } => {
                 let off = self.declare_var(name, ty.clone());
                 if let Some(e) = init {
-                    let (v, _) = self.lower_expr(e);
+                    let (v0, vty) = self.lower_expr(e);
+                    let v = self.coerce(v0, &vty, ty);
                     let addr = self.fresh();
                     self.body.push(Instr::AddrOf { dst: addr, off });
-                    self.body.push(Instr::StoreInd {
-                        addr,
-                        src: v,
-                        width: ty.size(),
-                    });
+                    let width = self.size_of(ty);
+                    self.body.push(Instr::StoreInd { addr, src: v, width });
                 }
             }
             Stmt::ExprStmt(e) => {
@@ -379,6 +433,13 @@ impl<'a> Lowerer<'a> {
                 self.body.push(Instr::Const { dst, value: *v });
                 (dst, Type::Int)
             }
+            Expr::FloatLit(v) => {
+                let index = self.floats.len();
+                self.floats.push(v.to_bits());
+                let dst = self.fresh();
+                self.body.push(Instr::ConstF { dst, index });
+                (dst, Type::Double)
+            }
             Expr::StrLit(s) => {
                 let index = self.strings.len();
                 self.strings.push(s.clone());
@@ -528,22 +589,28 @@ impl<'a> Lowerer<'a> {
                 (result, tty)
             }
             Expr::Assign { target, value } => {
-                let (v, vty) = self.lower_expr(value);
+                let (v0, vty) = self.lower_expr(value);
                 let (addr, ty) = self.lower_lvalue(target);
+                let v = self.coerce(v0, &vty, &ty);
                 let width = self.size_of(&ty);
                 self.body.push(Instr::StoreInd {
                     addr,
                     src: v,
                     width,
                 });
-                (v, vty)
+                (v, ty)
             }
             Expr::Call { name, args } => {
                 let arg_temps: Vec<Temp> = args.iter().map(|a| self.lower_expr(a).0).collect();
                 let dst = self.fresh();
                 let sig = self.signatures.get(name);
                 let ret = sig.map(|s| s.ret.clone()).unwrap_or(Type::Int);
-                let ret_width = if matches!(ret, Type::Pointer(_)) { 8 } else { 4 };
+                let ret_float = matches!(ret, Type::Double);
+                let ret_width = if matches!(ret, Type::Pointer(_) | Type::Double) {
+                    8
+                } else {
+                    4
+                };
                 let fixed = sig.map(|s| s.fixed).unwrap_or(arg_temps.len());
                 let variadic = sig.map(|s| s.variadic).unwrap_or(false);
                 self.body.push(Instr::Call {
@@ -553,6 +620,7 @@ impl<'a> Lowerer<'a> {
                     ret_width,
                     fixed,
                     variadic,
+                    ret_float,
                 });
                 (dst, ret)
             }
@@ -636,6 +704,24 @@ impl<'a> Lowerer<'a> {
             }
             return (dst, pty.decay());
         }
+        // 浮点运算：任一操作数为 double 即走 FP 路径（int 操作数提升为 double）
+        if matches!(lty, Type::Double) || matches!(rty, Type::Double) {
+            let lf = self.coerce(l, &lty, &Type::Double);
+            let rf = self.coerce(r, &rty, &Type::Double);
+            let dst = self.fresh();
+            self.body.push(Instr::BinF {
+                dst,
+                op: lower_binop(op),
+                lhs: lf,
+                rhs: rf,
+            });
+            let result_ty = if is_compare(op) {
+                Type::Int
+            } else {
+                Type::Double
+            };
+            return (dst, result_ty);
+        }
         let dst = self.fresh();
         self.body.push(Instr::Bin {
             dst,
@@ -657,6 +743,7 @@ impl<'a> Lowerer<'a> {
             | Expr::SizeofType(_)
             | Expr::SizeofExpr(_) => Type::Int,
             Expr::Ternary { then_e, .. } => self.type_of(then_e),
+            Expr::FloatLit(_) => Type::Double,
             Expr::StrLit(_) => Type::Pointer(Box::new(Type::Char)),
             Expr::Var(name) => self.var_type(name).map(|t| t.decay()).unwrap_or(Type::Int),
             Expr::Addr(inner) => Type::Pointer(Box::new(self.type_of_lvalue(inner))),
@@ -716,6 +803,13 @@ impl<'a> Lowerer<'a> {
     }
 }
 
+fn is_compare(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge | BinaryOp::Eq | BinaryOp::Ne
+    )
+}
+
 fn lower_binop(op: BinaryOp) -> BinOp {
     match op {
         BinaryOp::Add => BinOp::Add,
@@ -747,9 +841,11 @@ fn shift_of(size: usize) -> u32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_func(
     f: &FuncDef,
     strings: &mut Vec<String>,
+    floats: &mut Vec<u64>,
     aggregates: &Aggregates,
     signatures: &Signatures,
     globals: &HashMap<String, Type>,
@@ -760,9 +856,11 @@ fn lower_func(
         scopes: vec![HashMap::new()],
         next_label: 0,
         strings,
+        floats,
         aggregates,
         signatures,
         globals,
+        ret_ty: f.ret.clone(),
         break_targets: Vec::new(),
         continue_targets: Vec::new(),
     };
@@ -811,7 +909,7 @@ mod tests {
             f.body,
             vec![
                 Instr::Const { dst: 0, value: 42 },
-                Instr::Return { src: 0 },
+                Instr::Return { src: 0, is_float: false, width: 4 },
             ]
         );
     }
@@ -826,7 +924,7 @@ mod tests {
                 Instr::Const { dst: 0, value: 1 },
                 Instr::Const { dst: 8, value: 2 },
                 Instr::Bin { dst: 16, op: BinOp::Add, lhs: 0, rhs: 8 },
-                Instr::Return { src: 16 },
+                Instr::Return { src: 16, is_float: false, width: 4 },
             ]
         );
     }
@@ -839,7 +937,7 @@ mod tests {
             f.body,
             vec![
                 Instr::Const { dst: 0, value: 7 },
-                Instr::Return { src: 0 },
+                Instr::Return { src: 0, is_float: false, width: 4 },
             ]
         );
     }
@@ -852,7 +950,7 @@ mod tests {
             vec![
                 Instr::Const { dst: 0, value: 7 },
                 Instr::Neg { dst: 8, src: 0 },
-                Instr::Return { src: 8 },
+                Instr::Return { src: 8, is_float: false, width: 4 },
             ]
         );
     }
