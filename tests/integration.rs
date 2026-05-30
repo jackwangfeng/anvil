@@ -59,3 +59,58 @@ fn m1_parens_nested() {
     // ((2+3)*4) % 7 = 20 % 7 = 6
     assert_eq!(compile_and_run("int main(){ return ((2+3)*4)%7; }", "m1_nested"), 6);
 }
+
+#[test]
+fn m2_local_var() {
+    assert_eq!(
+        compile_and_run("int main(){ int x = 7; int y = 6; return x*y; }", "m2_var"),
+        42
+    );
+}
+
+#[test]
+fn m2_if_else() {
+    assert_eq!(
+        compile_and_run("int main(){ int x = 5; if (x > 3) return 1; else return 0; }", "m2_if"),
+        1
+    );
+}
+
+#[test]
+fn m2_while_sum() {
+    // 1+2+...+10 = 55
+    assert_eq!(
+        compile_and_run(
+            "int main(){ int s=0; int i=1; while (i<=10) { s=s+i; i=i+1; } return s; }",
+            "m2_while"
+        ),
+        55
+    );
+}
+
+#[test]
+fn m2_for_factorial() {
+    // 5! = 120
+    assert_eq!(
+        compile_and_run(
+            "int main(){ int r=1; for (int i=1; i<=5; i=i+1) r=r*i; return r; }",
+            "m2_for"
+        ),
+        120
+    );
+}
+
+#[test]
+fn m2_assignment_value() {
+    // 赋值表达式求值为所赋值
+    assert_eq!(
+        compile_and_run("int main(){ int x; int y = (x = 9); return y; }", "m2_assign_val"),
+        9
+    );
+}
+
+#[test]
+fn m2_equality() {
+    assert_eq!(compile_and_run("int main(){ int x = 4; return x == 4; }", "m2_eq"), 1);
+    assert_eq!(compile_and_run("int main(){ int x = 4; return x != 4; }", "m2_ne"), 0);
+}
