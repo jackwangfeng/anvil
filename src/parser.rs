@@ -525,6 +525,7 @@ mod tests {
             body[0],
             Stmt::Declare {
                 name: "x".to_string(),
+                ty: Type::Int,
                 init: Some(Expr::IntLit(5))
             }
         );
@@ -538,13 +539,14 @@ mod tests {
             body[0],
             Stmt::Declare {
                 name: "x".to_string(),
+                ty: Type::Int,
                 init: None
             }
         );
         assert_eq!(
             body[1],
             Stmt::ExprStmt(Expr::Assign {
-                name: "x".to_string(),
+                target: Box::new(Expr::Var("x".to_string())),
                 value: Box::new(Expr::IntLit(3)),
             })
         );
