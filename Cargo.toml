@@ -1,0 +1,12 @@
+[package]
+name = "bianyi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "bianyi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bianyi"
+path = "src/main.rs"
