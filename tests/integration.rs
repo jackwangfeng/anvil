@@ -20,6 +20,25 @@ fn compile_and_run(src: &str, name: &str) -> i32 {
     run.code().expect("program terminated by signal")
 }
 
+/// 编译 `src`，运行，返回 (退出码, stdout)。
+fn compile_run_capture(src: &str, name: &str) -> (i32, String) {
+    let dir = std::env::temp_dir();
+    let c_path = dir.join(format!("{}.c", name));
+    let exe_path = dir.join(name);
+    std::fs::write(&c_path, src).expect("write .c");
+    let bin = env!("CARGO_BIN_EXE_bianyi");
+    let compile = Command::new(bin)
+        .arg(&c_path)
+        .arg("-o")
+        .arg(&exe_path)
+        .status()
+        .expect("run bianyi");
+    assert!(compile.success(), "bianyi failed to compile {}", name);
+    let out = Command::new(&exe_path).output().expect("run compiled exe");
+    let code = out.status.code().expect("terminated by signal");
+    (code, String::from_utf8_lossy(&out.stdout).to_string())
+}
+
 #[test]
 fn m0_return_42() {
     assert_eq!(compile_and_run("int main(){ return 42; }", "m0_return_42"), 42);
@@ -113,4 +132,48 @@ fn m2_assignment_value() {
 fn m2_equality() {
     assert_eq!(compile_and_run("int main(){ int x = 4; return x == 4; }", "m2_eq"), 1);
     assert_eq!(compile_and_run("int main(){ int x = 4; return x != 4; }", "m2_ne"), 0);
+}
+
+#[test]
+fn m3_recursion_factorial() {
+    assert_eq!(
+        compile_and_run(
+            "int fact(int n){ if (n <= 1) return 1; return n * fact(n-1); } int main(){ return fact(5); }",
+            "m3_fact"
+        ),
+        120
+    );
+}
+
+#[test]
+fn m3_multiple_functions() {
+    assert_eq!(
+        compile_and_run(
+            "int add(int a, int b){ return a+b; } int main(){ return add(40, 2); }",
+            "m3_add"
+        ),
+        42
+    );
+}
+
+#[test]
+fn m3_recursion_fib() {
+    // fib(10) = 55
+    assert_eq!(
+        compile_and_run(
+            "int fib(int n){ if (n < 2) return n; return fib(n-1) + fib(n-2); } int main(){ return fib(10); }",
+            "m3_fib"
+        ),
+        55
+    );
+}
+
+#[test]
+fn m3_hello_world() {
+    let (code, stdout) = compile_run_capture(
+        "int main(){ puts(\"Hello, World!\"); return 0; }",
+        "m3_hello",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "Hello, World!\n"); // puts 追加换行
 }
