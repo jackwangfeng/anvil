@@ -1,4 +1,4 @@
-use crate::ast::{BinaryOp, Expr, FuncDef, Program, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, Expr, FuncDef, LogOp, Program, Stmt, UnaryOp};
 use crate::error::CompileError;
 use crate::token::{Token, TokenKind};
 use crate::types::{Aggregate, Aggregates, Field, Signature, Signatures, Type};
@@ -475,25 +475,89 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_assign(&mut self) -> Result<Expr, CompileError> {
-        let lhs = self.parse_bin_expr(1)?;
-        if *self.peek_kind() == TokenKind::Assign {
-            self.pos += 1;
-            let value = self.parse_assign()?; // 右结合
-            match &lhs {
-                Expr::Var(_) | Expr::Deref(_) | Expr::Index { .. } | Expr::Member { .. } => {
-                    Ok(Expr::Assign {
-                        target: Box::new(lhs),
-                        value: Box::new(value),
-                    })
-                }
-                _ => Err(CompileError::new(
-                    self.tokens[self.pos.saturating_sub(1)].span,
-                    "invalid assignment target".to_string(),
-                )),
-            }
-        } else {
-            Ok(lhs)
+        let lhs = self.parse_ternary()?;
+        let compound = match self.peek_kind() {
+            TokenKind::Assign => None,
+            TokenKind::PlusEq => Some(BinaryOp::Add),
+            TokenKind::MinusEq => Some(BinaryOp::Sub),
+            TokenKind::StarEq => Some(BinaryOp::Mul),
+            TokenKind::SlashEq => Some(BinaryOp::Div),
+            TokenKind::PercentEq => Some(BinaryOp::Mod),
+            TokenKind::AmpEq => Some(BinaryOp::BitAnd),
+            TokenKind::PipeEq => Some(BinaryOp::BitOr),
+            TokenKind::CaretEq => Some(BinaryOp::BitXor),
+            TokenKind::ShlEq => Some(BinaryOp::Shl),
+            TokenKind::ShrEq => Some(BinaryOp::Shr),
+            _ => return Ok(lhs),
+        };
+        if !matches!(
+            lhs,
+            Expr::Var(_) | Expr::Deref(_) | Expr::Index { .. } | Expr::Member { .. }
+        ) {
+            return Err(CompileError::new(
+                self.tokens[self.pos].span,
+                "invalid assignment target".to_string(),
+            ));
         }
+        self.pos += 1;
+        let rhs = self.parse_assign()?; // 右结合
+        let value = match compound {
+            None => rhs,
+            Some(op) => Expr::Binary {
+                op,
+                lhs: Box::new(lhs.clone()),
+                rhs: Box::new(rhs),
+            },
+        };
+        Ok(Expr::Assign {
+            target: Box::new(lhs),
+            value: Box::new(value),
+        })
+    }
+
+    fn parse_ternary(&mut self) -> Result<Expr, CompileError> {
+        let cond = self.parse_logical_or()?;
+        if *self.peek_kind() == TokenKind::Question {
+            self.pos += 1;
+            let then_e = self.parse_expr()?;
+            self.expect(&TokenKind::Colon)?;
+            let else_e = self.parse_assign()?;
+            Ok(Expr::Ternary {
+                cond: Box::new(cond),
+                then_e: Box::new(then_e),
+                else_e: Box::new(else_e),
+            })
+        } else {
+            Ok(cond)
+        }
+    }
+
+    fn parse_logical_or(&mut self) -> Result<Expr, CompileError> {
+        let mut l = self.parse_logical_and()?;
+        while *self.peek_kind() == TokenKind::PipePipe {
+            self.pos += 1;
+            let r = self.parse_logical_and()?;
+            l = Expr::Logical {
+                op: LogOp::Or,
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+            };
+        }
+        Ok(l)
+    }
+
+    fn parse_logical_and(&mut self) -> Result<Expr, CompileError> {
+        let mut l = self.parse_bin_expr(1)?;
+        while *self.peek_kind() == TokenKind::AmpAmp {
+            self.pos += 1;
+            let r = self.parse_bin_expr(1)?;
+            l = Expr::Logical {
+                op: LogOp::And,
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+            };
+        }
+        Ok(l)
     }
 
     /// 优先级爬升：min_prec 为当前可接受的最低运算符优先级。
@@ -537,6 +601,39 @@ impl<'a> Parser<'a> {
             TokenKind::Star => {
                 self.pos += 1;
                 Ok(Expr::Deref(Box::new(self.parse_unary()?)))
+            }
+            TokenKind::Bang => {
+                // !x  =>  (x == 0)
+                self.pos += 1;
+                let e = self.parse_unary()?;
+                Ok(Expr::Binary {
+                    op: BinaryOp::Eq,
+                    lhs: Box::new(e),
+                    rhs: Box::new(Expr::IntLit(0)),
+                })
+            }
+            TokenKind::Tilde => {
+                // ~x  =>  x ^ -1
+                self.pos += 1;
+                let e = self.parse_unary()?;
+                Ok(Expr::Binary {
+                    op: BinaryOp::BitXor,
+                    lhs: Box::new(e),
+                    rhs: Box::new(Expr::Unary {
+                        op: UnaryOp::Neg,
+                        operand: Box::new(Expr::IntLit(1)),
+                    }),
+                })
+            }
+            TokenKind::PlusPlus => {
+                self.pos += 1;
+                let e = self.parse_unary()?;
+                Ok(incdec_assign(e, BinaryOp::Add))
+            }
+            TokenKind::MinusMinus => {
+                self.pos += 1;
+                let e = self.parse_unary()?;
+                Ok(incdec_assign(e, BinaryOp::Sub))
             }
             TokenKind::KwSizeof => {
                 self.pos += 1;
@@ -585,6 +682,15 @@ impl<'a> Parser<'a> {
                         field,
                         arrow: true,
                     };
+                }
+                // 后缀 ++/--（M8 简化：求值为自增后的新值，非旧值）
+                TokenKind::PlusPlus => {
+                    self.pos += 1;
+                    e = incdec_assign(e, BinaryOp::Add);
+                }
+                TokenKind::MinusMinus => {
+                    self.pos += 1;
+                    e = incdec_assign(e, BinaryOp::Sub);
                 }
                 _ => break,
             }
@@ -644,19 +750,37 @@ impl<'a> Parser<'a> {
 }
 
 fn binop_of(kind: &TokenKind) -> Option<(BinaryOp, u8)> {
+    // 优先级（越大越紧）：| < ^ < & < ==/!= < 比较 < <<>> < +- < */%
     match kind {
-        TokenKind::EqEq => Some((BinaryOp::Eq, 1)),
-        TokenKind::NotEq => Some((BinaryOp::Ne, 1)),
-        TokenKind::Lt => Some((BinaryOp::Lt, 2)),
-        TokenKind::Gt => Some((BinaryOp::Gt, 2)),
-        TokenKind::Le => Some((BinaryOp::Le, 2)),
-        TokenKind::Ge => Some((BinaryOp::Ge, 2)),
-        TokenKind::Plus => Some((BinaryOp::Add, 3)),
-        TokenKind::Minus => Some((BinaryOp::Sub, 3)),
-        TokenKind::Star => Some((BinaryOp::Mul, 4)),
-        TokenKind::Slash => Some((BinaryOp::Div, 4)),
-        TokenKind::Percent => Some((BinaryOp::Mod, 4)),
+        TokenKind::Pipe => Some((BinaryOp::BitOr, 1)),
+        TokenKind::Caret => Some((BinaryOp::BitXor, 2)),
+        TokenKind::Amp => Some((BinaryOp::BitAnd, 3)),
+        TokenKind::EqEq => Some((BinaryOp::Eq, 4)),
+        TokenKind::NotEq => Some((BinaryOp::Ne, 4)),
+        TokenKind::Lt => Some((BinaryOp::Lt, 5)),
+        TokenKind::Gt => Some((BinaryOp::Gt, 5)),
+        TokenKind::Le => Some((BinaryOp::Le, 5)),
+        TokenKind::Ge => Some((BinaryOp::Ge, 5)),
+        TokenKind::Shl => Some((BinaryOp::Shl, 6)),
+        TokenKind::Shr => Some((BinaryOp::Shr, 6)),
+        TokenKind::Plus => Some((BinaryOp::Add, 7)),
+        TokenKind::Minus => Some((BinaryOp::Sub, 7)),
+        TokenKind::Star => Some((BinaryOp::Mul, 8)),
+        TokenKind::Slash => Some((BinaryOp::Div, 8)),
+        TokenKind::Percent => Some((BinaryOp::Mod, 8)),
         _ => None,
+    }
+}
+
+/// 把 `++e`/`--e`/`e++`/`e--` 脱糖为 `e = e <op> 1`（M8 取舍：求值为新值）。
+fn incdec_assign(e: Expr, op: BinaryOp) -> Expr {
+    Expr::Assign {
+        target: Box::new(e.clone()),
+        value: Box::new(Expr::Binary {
+            op,
+            lhs: Box::new(e),
+            rhs: Box::new(Expr::IntLit(1)),
+        }),
     }
 }
 

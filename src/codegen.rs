@@ -97,6 +97,15 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             let _ = writeln!(out, "    add x9, x9, #{}", offset);
             let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
         }
+        Instr::Copy { dst, src, width } => {
+            if *width == 8 {
+                let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*src));
+                let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+            } else {
+                let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*src));
+                let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
+            }
+        }
         Instr::LoadInd { dst, addr, width, signed } => {
             let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*addr));
             match (*width, *signed) {
@@ -181,6 +190,11 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
                 BinOp::Ge => out.push_str("    cmp w9, w10\n    cset w9, ge\n"),
                 BinOp::Eq => out.push_str("    cmp w9, w10\n    cset w9, eq\n"),
                 BinOp::Ne => out.push_str("    cmp w9, w10\n    cset w9, ne\n"),
+                BinOp::BitAnd => out.push_str("    and w9, w9, w10\n"),
+                BinOp::BitOr => out.push_str("    orr w9, w9, w10\n"),
+                BinOp::BitXor => out.push_str("    eor w9, w9, w10\n"),
+                BinOp::Shl => out.push_str("    lsl w9, w9, w10\n"),
+                BinOp::Shr => out.push_str("    asr w9, w9, w10\n"),
             }
             let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
         }
