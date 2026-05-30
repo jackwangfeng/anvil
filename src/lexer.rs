@@ -21,7 +21,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 line += 1;
                 col = 1;
             }
-            '(' | ')' | '{' | '}' | ';' | '+' | '-' | '*' | '/' | '%' | ',' => {
+            '(' | ')' | '{' | '}' | ';' | '+' | '-' | '*' | '/' | '%' | ',' | '&' | '['
+            | ']' => {
                 let kind = match c {
                     '(' => TokenKind::LParen,
                     ')' => TokenKind::RParen,
@@ -34,6 +35,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     '/' => TokenKind::Slash,
                     '%' => TokenKind::Percent,
                     ',' => TokenKind::Comma,
+                    '&' => TokenKind::Amp,
+                    '[' => TokenKind::LBracket,
+                    ']' => TokenKind::RBracket,
                     _ => unreachable!(),
                 };
                 tokens.push(Token { kind, span: Span::new(line, col) });
@@ -173,6 +177,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     "else" => TokenKind::KwElse,
                     "while" => TokenKind::KwWhile,
                     "for" => TokenKind::KwFor,
+                    "char" => TokenKind::KwChar,
+                    "sizeof" => TokenKind::KwSizeof,
                     _ => TokenKind::Ident(ident),
                 };
                 tokens.push(Token { kind, span: Span::new(line, start_col) });
@@ -240,6 +246,22 @@ mod tests {
                 TokenKind::Star,
                 TokenKind::Slash,
                 TokenKind::Percent,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_m4_tokens() {
+        assert_eq!(
+            kinds("& [ ] char sizeof *"),
+            vec![
+                TokenKind::Amp,
+                TokenKind::LBracket,
+                TokenKind::RBracket,
+                TokenKind::KwChar,
+                TokenKind::KwSizeof,
+                TokenKind::Star,
                 TokenKind::Eof,
             ]
         );
