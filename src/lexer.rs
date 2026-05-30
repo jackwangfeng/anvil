@@ -21,26 +21,80 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 line += 1;
                 col = 1;
             }
-            '(' | ')' | '{' | '}' | ';' | '+' | '*' | '/' | '%' | ',' | '&' | '[' | ']' => {
+            '(' | ')' | '{' | '}' | ';' | ',' | '[' | ']' | '~' | '?' | ':' => {
                 let kind = match c {
                     '(' => TokenKind::LParen,
                     ')' => TokenKind::RParen,
                     '{' => TokenKind::LBrace,
                     '}' => TokenKind::RBrace,
                     ';' => TokenKind::Semicolon,
-                    '+' => TokenKind::Plus,
-                    '*' => TokenKind::Star,
-                    '/' => TokenKind::Slash,
-                    '%' => TokenKind::Percent,
                     ',' => TokenKind::Comma,
-                    '&' => TokenKind::Amp,
                     '[' => TokenKind::LBracket,
                     ']' => TokenKind::RBracket,
+                    '~' => TokenKind::Tilde,
+                    '?' => TokenKind::Question,
+                    ':' => TokenKind::Colon,
                     _ => unreachable!(),
                 };
                 tokens.push(Token { kind, span: Span::new(line, col) });
                 i += 1;
                 col += 1;
+            }
+            '+' | '*' | '%' | '^' | '|' | '&' => {
+                // 一/二字符运算符：X、X=、（&&/||/++）
+                let next = chars.get(i + 1).copied();
+                let (kind, len) = match (c, next) {
+                    ('+', Some('+')) => (TokenKind::PlusPlus, 2),
+                    ('+', Some('=')) => (TokenKind::PlusEq, 2),
+                    ('+', _) => (TokenKind::Plus, 1),
+                    ('*', Some('=')) => (TokenKind::StarEq, 2),
+                    ('*', _) => (TokenKind::Star, 1),
+                    ('%', Some('=')) => (TokenKind::PercentEq, 2),
+                    ('%', _) => (TokenKind::Percent, 1),
+                    ('^', Some('=')) => (TokenKind::CaretEq, 2),
+                    ('^', _) => (TokenKind::Caret, 1),
+                    ('|', Some('|')) => (TokenKind::PipePipe, 2),
+                    ('|', Some('=')) => (TokenKind::PipeEq, 2),
+                    ('|', _) => (TokenKind::Pipe, 1),
+                    ('&', Some('&')) => (TokenKind::AmpAmp, 2),
+                    ('&', Some('=')) => (TokenKind::AmpEq, 2),
+                    ('&', _) => (TokenKind::Amp, 1),
+                    _ => unreachable!(),
+                };
+                tokens.push(Token { kind, span: Span::new(line, col) });
+                i += len;
+                col += len as u32;
+            }
+            '/' => {
+                // 注释 // 与 /* */，以及 / 和 /=
+                if chars.get(i + 1) == Some(&'/') {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                        col += 1;
+                    }
+                } else if chars.get(i + 1) == Some(&'*') {
+                    i += 2;
+                    col += 2;
+                    while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                        if chars[i] == '\n' {
+                            line += 1;
+                            col = 1;
+                        } else {
+                            col += 1;
+                        }
+                        i += 1;
+                    }
+                    i += 2; // 跳过 */
+                    col += 2;
+                } else if chars.get(i + 1) == Some(&'=') {
+                    tokens.push(Token { kind: TokenKind::SlashEq, span: Span::new(line, col) });
+                    i += 2;
+                    col += 2;
+                } else {
+                    tokens.push(Token { kind: TokenKind::Slash, span: Span::new(line, col) });
+                    i += 1;
+                    col += 1;
+                }
             }
             '.' => {
                 if i + 2 < chars.len() && chars[i + 1] == '.' && chars[i + 2] == '.' {
@@ -54,15 +108,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 }
             }
             '-' => {
-                if i + 1 < chars.len() && chars[i + 1] == '>' {
-                    tokens.push(Token { kind: TokenKind::Arrow, span: Span::new(line, col) });
-                    i += 2;
-                    col += 2;
-                } else {
-                    tokens.push(Token { kind: TokenKind::Minus, span: Span::new(line, col) });
-                    i += 1;
-                    col += 1;
-                }
+                let next = chars.get(i + 1).copied();
+                let (kind, len) = match next {
+                    Some('>') => (TokenKind::Arrow, 2),
+                    Some('-') => (TokenKind::MinusMinus, 2),
+                    Some('=') => (TokenKind::MinusEq, 2),
+                    _ => (TokenKind::Minus, 1),
+                };
+                tokens.push(Token { kind, span: Span::new(line, col) });
+                i += len;
+                col += len as u32;
             }
             '"' => {
                 let start_col = col;
@@ -130,37 +185,46 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 }
             }
             '<' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(Token { kind: TokenKind::Le, span: Span::new(line, col) });
-                    i += 2;
-                    col += 2;
+                let (kind, len) = if chars.get(i + 1) == Some(&'<') {
+                    if chars.get(i + 2) == Some(&'=') {
+                        (TokenKind::ShlEq, 3)
+                    } else {
+                        (TokenKind::Shl, 2)
+                    }
+                } else if chars.get(i + 1) == Some(&'=') {
+                    (TokenKind::Le, 2)
                 } else {
-                    tokens.push(Token { kind: TokenKind::Lt, span: Span::new(line, col) });
-                    i += 1;
-                    col += 1;
-                }
+                    (TokenKind::Lt, 1)
+                };
+                tokens.push(Token { kind, span: Span::new(line, col) });
+                i += len;
+                col += len as u32;
             }
             '>' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(Token { kind: TokenKind::Ge, span: Span::new(line, col) });
-                    i += 2;
-                    col += 2;
+                let (kind, len) = if chars.get(i + 1) == Some(&'>') {
+                    if chars.get(i + 2) == Some(&'=') {
+                        (TokenKind::ShrEq, 3)
+                    } else {
+                        (TokenKind::Shr, 2)
+                    }
+                } else if chars.get(i + 1) == Some(&'=') {
+                    (TokenKind::Ge, 2)
                 } else {
-                    tokens.push(Token { kind: TokenKind::Gt, span: Span::new(line, col) });
-                    i += 1;
-                    col += 1;
-                }
+                    (TokenKind::Gt, 1)
+                };
+                tokens.push(Token { kind, span: Span::new(line, col) });
+                i += len;
+                col += len as u32;
             }
             '!' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                if chars.get(i + 1) == Some(&'=') {
                     tokens.push(Token { kind: TokenKind::NotEq, span: Span::new(line, col) });
                     i += 2;
                     col += 2;
                 } else {
-                    return Err(CompileError::new(
-                        Span::new(line, col),
-                        "unexpected character '!'".to_string(),
-                    ));
+                    tokens.push(Token { kind: TokenKind::Bang, span: Span::new(line, col) });
+                    i += 1;
+                    col += 1;
                 }
             }
             c if c.is_ascii_digit() => {
@@ -275,6 +339,36 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn lex_m8_operators() {
+        assert_eq!(
+            kinds("&& || ! ~ | ^ << >> ++ -- += <<= ? :"),
+            vec![
+                TokenKind::AmpAmp,
+                TokenKind::PipePipe,
+                TokenKind::Bang,
+                TokenKind::Tilde,
+                TokenKind::Pipe,
+                TokenKind::Caret,
+                TokenKind::Shl,
+                TokenKind::Shr,
+                TokenKind::PlusPlus,
+                TokenKind::MinusMinus,
+                TokenKind::PlusEq,
+                TokenKind::ShlEq,
+                TokenKind::Question,
+                TokenKind::Colon,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_comments() {
+        assert_eq!(kinds("1 // line\n+ 2"), vec![TokenKind::IntLit(1), TokenKind::Plus, TokenKind::IntLit(2), TokenKind::Eof]);
+        assert_eq!(kinds("1 /* block */ + 2"), vec![TokenKind::IntLit(1), TokenKind::Plus, TokenKind::IntLit(2), TokenKind::Eof]);
     }
 
     #[test]
