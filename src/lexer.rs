@@ -21,13 +21,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 line += 1;
                 col = 1;
             }
-            '(' | ')' | '{' | '}' | ';' => {
+            '(' | ')' | '{' | '}' | ';' | '+' | '-' | '*' | '/' | '%' => {
                 let kind = match c {
                     '(' => TokenKind::LParen,
                     ')' => TokenKind::RParen,
                     '{' => TokenKind::LBrace,
                     '}' => TokenKind::RBrace,
                     ';' => TokenKind::Semicolon,
+                    '+' => TokenKind::Plus,
+                    '-' => TokenKind::Minus,
+                    '*' => TokenKind::Star,
+                    '/' => TokenKind::Slash,
+                    '%' => TokenKind::Percent,
                     _ => unreachable!(),
                 };
                 tokens.push(Token { kind, span: Span::new(line, col) });
@@ -119,5 +124,20 @@ mod tests {
     fn lex_rejects_unknown_char() {
         let err = lex("int @").unwrap_err();
         assert!(err.message.contains('@'));
+    }
+
+    #[test]
+    fn lex_arithmetic_operators() {
+        assert_eq!(
+            kinds("+ - * / %"),
+            vec![
+                TokenKind::Plus,
+                TokenKind::Minus,
+                TokenKind::Star,
+                TokenKind::Slash,
+                TokenKind::Percent,
+                TokenKind::Eof,
+            ]
+        );
     }
 }

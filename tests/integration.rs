@@ -29,3 +29,33 @@ fn m0_return_42() {
 fn m0_return_0() {
     assert_eq!(compile_and_run("int main(){ return 0; }", "m0_return_0"), 0);
 }
+
+#[test]
+fn m1_precedence() {
+    // 1 + 2*3 - (4/2) = 1 + 6 - 2 = 5
+    assert_eq!(compile_and_run("int main(){ return 1+2*3-(4/2); }", "m1_prec"), 5);
+}
+
+#[test]
+fn m1_left_assoc() {
+    // 20 - 5 - 3 = 12
+    assert_eq!(compile_and_run("int main(){ return 20-5-3; }", "m1_lassoc"), 12);
+}
+
+#[test]
+fn m1_modulo() {
+    // 17 % 5 = 2
+    assert_eq!(compile_and_run("int main(){ return 17%5; }", "m1_mod"), 2);
+}
+
+#[test]
+fn m1_unary_neg_in_expr() {
+    // 10 + -3 = 7
+    assert_eq!(compile_and_run("int main(){ return 10 + -3; }", "m1_neg"), 7);
+}
+
+#[test]
+fn m1_parens_nested() {
+    // ((2+3)*4) % 7 = 20 % 7 = 6
+    assert_eq!(compile_and_run("int main(){ return ((2+3)*4)%7; }", "m1_nested"), 6);
+}

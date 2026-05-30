@@ -11,6 +11,11 @@ pub enum TokenKind {
     LBrace,
     RBrace,
     Semicolon,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
     Eof,
 }
 
