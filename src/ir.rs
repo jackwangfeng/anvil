@@ -9,6 +9,14 @@ pub type Temp = usize;
 pub struct Program {
     pub functions: Vec<Function>,
     pub strings: Vec<String>,
+    pub globals: Vec<GlobalVar>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalVar {
+    pub name: String,
+    pub size: usize,
+    pub init: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +45,7 @@ pub enum Instr {
     StrLit { dst: Temp, index: usize },
     LoadArg { dst: Temp, index: usize, width: usize },
     AddrOf { dst: Temp, off: usize },
+    GlobalAddr { dst: Temp, name: String },
     FieldAddr { dst: Temp, base: Temp, offset: usize },
     Copy { dst: Temp, src: Temp, width: usize },
     LoadInd { dst: Temp, addr: Temp, width: usize, signed: bool },
@@ -68,12 +77,30 @@ pub enum BinOp {
 
 pub fn lower(ast: &AstProgram) -> Program {
     let mut strings = Vec::new();
+    let global_types: HashMap<String, Type> = ast
+        .globals
+        .iter()
+        .map(|g| (g.name.clone(), g.ty.clone()))
+        .collect();
     let functions = ast
         .functions
         .iter()
-        .map(|f| lower_func(f, &mut strings, &ast.aggregates, &ast.signatures))
+        .map(|f| lower_func(f, &mut strings, &ast.aggregates, &ast.signatures, &global_types))
         .collect();
-    Program { functions, strings }
+    let globals = ast
+        .globals
+        .iter()
+        .map(|g| GlobalVar {
+            name: g.name.clone(),
+            size: crate::types::size_of(&g.ty, &ast.aggregates),
+            init: g.init,
+        })
+        .collect();
+    Program {
+        functions,
+        strings,
+        globals,
+    }
 }
 
 struct Lowerer<'a> {
@@ -84,6 +111,7 @@ struct Lowerer<'a> {
     strings: &'a mut Vec<String>,
     aggregates: &'a Aggregates,
     signatures: &'a Signatures,
+    globals: &'a HashMap<String, Type>,
     break_targets: Vec<usize>,
     continue_targets: Vec<usize>,
 }
@@ -133,6 +161,30 @@ impl<'a> Lowerer<'a> {
 
     fn size_of(&self, ty: &Type) -> usize {
         crate::types::size_of(ty, self.aggregates)
+    }
+
+    /// 取变量地址：局部用 AddrOf，全局用 GlobalAddr。返回 (地址临时量, 变量类型)。
+    fn var_addr(&mut self, name: &str) -> (Temp, Type) {
+        if let Some((off, ty)) = self.lookup_var(name) {
+            let dst = self.fresh();
+            self.body.push(Instr::AddrOf { dst, off });
+            (dst, ty)
+        } else if let Some(ty) = self.globals.get(name).cloned() {
+            let dst = self.fresh();
+            self.body.push(Instr::GlobalAddr {
+                dst,
+                name: name.to_string(),
+            });
+            (dst, ty)
+        } else {
+            panic!("undeclared variable: {}", name);
+        }
+    }
+
+    fn var_type(&self, name: &str) -> Option<Type> {
+        self.lookup_var(name)
+            .map(|(_, t)| t)
+            .or_else(|| self.globals.get(name).cloned())
     }
 
     fn field_info(&self, struct_ty: &Type, field: &str) -> (usize, Type) {
@@ -335,23 +387,11 @@ impl<'a> Lowerer<'a> {
                 (dst, Type::Pointer(Box::new(Type::Char)))
             }
             Expr::Var(name) => {
-                let (off, ty) = self.lookup_var(name).expect("undeclared variable");
+                let (addr, ty) = self.var_addr(name);
                 match ty {
-                    Type::Array(elem, _) => {
-                        // 数组退化为首元素地址
-                        let dst = self.fresh();
-                        self.body.push(Instr::AddrOf { dst, off });
-                        (dst, Type::Pointer(elem))
-                    }
-                    Type::Struct(_) | Type::Union(_) => {
-                        // 聚合体不作整体读出，产出其地址（仅作成员访问/取址的基）
-                        let dst = self.fresh();
-                        self.body.push(Instr::AddrOf { dst, off });
-                        (dst, ty)
-                    }
+                    Type::Array(elem, _) => (addr, Type::Pointer(elem)), // 退化为首元素地址
+                    Type::Struct(_) | Type::Union(_) => (addr, ty),      // 聚合体产出地址
                     scalar => {
-                        let addr = self.fresh();
-                        self.body.push(Instr::AddrOf { dst: addr, off });
                         let dst = self.fresh();
                         let width = self.size_of(&scalar);
                         self.body.push(Instr::LoadInd {
@@ -522,12 +562,7 @@ impl<'a> Lowerer<'a> {
     /// 返回 (左值地址临时量, 被指类型)。
     fn lower_lvalue(&mut self, e: &Expr) -> (Temp, Type) {
         match e {
-            Expr::Var(name) => {
-                let (off, ty) = self.lookup_var(name).expect("undeclared variable");
-                let dst = self.fresh();
-                self.body.push(Instr::AddrOf { dst, off });
-                (dst, ty)
-            }
+            Expr::Var(name) => self.var_addr(name),
             Expr::Deref(inner) => {
                 let (ptr, ty) = self.lower_expr(inner);
                 let pointee = ty.decay().pointee().expect("deref of non-pointer").clone();
@@ -623,10 +658,7 @@ impl<'a> Lowerer<'a> {
             | Expr::SizeofExpr(_) => Type::Int,
             Expr::Ternary { then_e, .. } => self.type_of(then_e),
             Expr::StrLit(_) => Type::Pointer(Box::new(Type::Char)),
-            Expr::Var(name) => self
-                .lookup_var(name)
-                .map(|(_, t)| t.decay())
-                .unwrap_or(Type::Int),
+            Expr::Var(name) => self.var_type(name).map(|t| t.decay()).unwrap_or(Type::Int),
             Expr::Addr(inner) => Type::Pointer(Box::new(self.type_of_lvalue(inner))),
             Expr::Deref(inner) => self
                 .type_of(inner)
@@ -656,7 +688,7 @@ impl<'a> Lowerer<'a> {
 
     fn type_of_lvalue(&self, e: &Expr) -> Type {
         match e {
-            Expr::Var(name) => self.lookup_var(name).map(|(_, t)| t).unwrap_or(Type::Int),
+            Expr::Var(name) => self.var_type(name).unwrap_or(Type::Int),
             Expr::Member { base, field, arrow } => {
                 let sty = if *arrow {
                     self.type_of(base).decay().pointee().cloned().unwrap_or(Type::Int)
@@ -720,6 +752,7 @@ fn lower_func(
     strings: &mut Vec<String>,
     aggregates: &Aggregates,
     signatures: &Signatures,
+    globals: &HashMap<String, Type>,
 ) -> Function {
     let mut lw = Lowerer {
         body: Vec::new(),
@@ -729,6 +762,7 @@ fn lower_func(
         strings,
         aggregates,
         signatures,
+        globals,
         break_targets: Vec::new(),
         continue_targets: Vec::new(),
     };

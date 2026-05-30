@@ -42,6 +42,35 @@ fn err(msg: impl Into<String>) -> CompileError {
     CompileError::new(Span::new(0, 0), msg.into())
 }
 
+/// 内置最小系统头：声明常用 libc 函数（提供返回类型与可变参数信息）。
+fn builtin_header(name: &str) -> Option<&'static str> {
+    match name {
+        "stdio.h" => Some(
+            "int printf(const char*, ...);\n\
+             int puts(const char*);\n\
+             int putchar(int);\n\
+             int getchar(void);\n\
+             int scanf(const char*, ...);\n",
+        ),
+        "stdlib.h" => Some(
+            "void* malloc(int);\n\
+             void* calloc(int, int);\n\
+             void free(void*);\n\
+             int atoi(const char*);\n\
+             int abs(int);\n\
+             void exit(int);\n",
+        ),
+        "string.h" => Some(
+            "int strlen(const char*);\n\
+             int strcmp(const char*, const char*);\n\
+             char* strcpy(char*, const char*);\n\
+             void* memcpy(void*, void*, int);\n\
+             void* memset(void*, int, int);\n",
+        ),
+        _ => None,
+    }
+}
+
 impl Preprocessor {
     fn run(&mut self, src: &str) -> Result<String, CompileError> {
         // 条件编译状态栈：每层 (本分支是否激活, 该 #if 链是否已有分支被采用)
@@ -177,9 +206,9 @@ impl Preprocessor {
         let a = args.trim();
         let path = if let Some(inner) = a.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
             self.base_dir.join(inner)
-        } else if a.starts_with('<') {
-            // 系统头：M6 不提供，返回空（best-effort）
-            return Ok(String::new());
+        } else if let Some(inner) = a.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+            // 系统头：提供内置最小原型集（声明常用 libc 函数）
+            return Ok(builtin_header(inner.trim()).unwrap_or("").to_string());
         } else {
             return Err(err(format!("bad #include: {}", a)));
         };

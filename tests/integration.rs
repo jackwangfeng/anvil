@@ -446,3 +446,51 @@ fn m9_while_break() {
         42
     );
 }
+
+#[test]
+fn m10_global_var() {
+    assert_eq!(
+        compile_and_run("int counter = 10; int bump(){ counter = counter + 1; return counter; } int main(){ bump(); bump(); return counter; }", "m10_glob"),
+        12
+    );
+}
+
+#[test]
+fn m10_global_array() {
+    assert_eq!(
+        compile_and_run("int arr[3]; int main(){ arr[0]=10; arr[1]=20; arr[2]=12; return arr[0]+arr[1]+arr[2]; }", "m10_garr"),
+        42
+    );
+}
+
+#[test]
+fn m10_many_args() {
+    assert_eq!(
+        compile_and_run("int sum10(int a,int b,int c,int d,int e,int f,int g,int h,int i,int j){ return a+b+c+d+e+f+g+h+i+j; } int main(){ return sum10(1,2,3,4,5,6,7,8,9,10); }", "m10_args"),
+        55
+    );
+}
+
+#[test]
+fn m10_char_literal() {
+    assert_eq!(compile_and_run("int main(){ return 'A'; }", "m10_charlit"), 65);
+}
+
+#[test]
+fn m10_system_header_printf() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ printf(\"x=%d\\n\", 99); return 0; }",
+        "m10_sysh",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "x=99\n");
+}
+
+#[test]
+fn m10_realistic_program() {
+    // 综合：系统头 + 全局 + 循环 + printf + malloc + 字符字面量
+    let src = "#include <stdio.h>\n#include <stdlib.h>\nint total = 0;\nint add(int x){ total = total + x; return total; }\nint main(){ for (int i = 1; i <= 5; i++) add(i); char* p = malloc(4); p[0]='O'; p[1]='K'; p[2]=0; printf(\"%s %d\\n\", p, total); return total; }";
+    let (code, out) = compile_run_capture(src, "m10_real");
+    assert_eq!(code, 15);
+    assert_eq!(out, "OK 15\n");
+}

@@ -119,6 +119,58 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 i += len;
                 col += len as u32;
             }
+            '\'' => {
+                // 字符字面量 'x' / '\n' 等 → 整型常量（其字符码）
+                let start_col = col;
+                i += 1;
+                col += 1;
+                if i >= chars.len() {
+                    return Err(CompileError::new(
+                        Span::new(line, start_col),
+                        "unterminated char literal".to_string(),
+                    ));
+                }
+                let value: i64 = if chars[i] == '\\' {
+                    i += 1;
+                    col += 1;
+                    let v = match chars.get(i) {
+                        Some('n') => 10,
+                        Some('t') => 9,
+                        Some('r') => 13,
+                        Some('0') => 0,
+                        Some('\\') => 92,
+                        Some('\'') => 39,
+                        Some('"') => 34,
+                        Some(&other) => other as i64,
+                        None => {
+                            return Err(CompileError::new(
+                                Span::new(line, start_col),
+                                "unterminated char literal".to_string(),
+                            ))
+                        }
+                    };
+                    i += 1;
+                    col += 1;
+                    v
+                } else {
+                    let v = chars[i] as i64;
+                    i += 1;
+                    col += 1;
+                    v
+                };
+                if chars.get(i) != Some(&'\'') {
+                    return Err(CompileError::new(
+                        Span::new(line, start_col),
+                        "unterminated char literal".to_string(),
+                    ));
+                }
+                i += 1;
+                col += 1;
+                tokens.push(Token {
+                    kind: TokenKind::IntLit(value),
+                    span: Span::new(line, start_col),
+                });
+            }
             '"' => {
                 let start_col = col;
                 i += 1; // 跳过开引号
