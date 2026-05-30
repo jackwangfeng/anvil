@@ -41,6 +41,14 @@ pub enum Stmt {
         step: Option<Expr>,
         body: Box<Stmt>,
     },
+    Break,
+    Continue,
+    Switch {
+        cond: Expr,
+        body: Vec<Stmt>,
+    },
+    Case(i64),
+    Default,
     Empty,
 }
 

@@ -84,6 +84,8 @@ struct Lowerer<'a> {
     strings: &'a mut Vec<String>,
     aggregates: &'a Aggregates,
     signatures: &'a Signatures,
+    break_targets: Vec<usize>,
+    continue_targets: Vec<usize>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -209,7 +211,11 @@ impl<'a> Lowerer<'a> {
                     cond: c,
                     target: end,
                 });
+                self.break_targets.push(end);
+                self.continue_targets.push(start);
                 self.lower_stmt(body);
+                self.break_targets.pop();
+                self.continue_targets.pop();
                 self.body.push(Instr::Jump(start));
                 self.body.push(Instr::Label(end));
             }
@@ -224,6 +230,7 @@ impl<'a> Lowerer<'a> {
                     self.lower_stmt(init_s);
                 }
                 let start = self.new_label();
+                let cont = self.new_label();
                 let end = self.new_label();
                 self.body.push(Instr::Label(start));
                 if let Some(c) = cond {
@@ -233,7 +240,12 @@ impl<'a> Lowerer<'a> {
                         target: end,
                     });
                 }
+                self.break_targets.push(end);
+                self.continue_targets.push(cont); // continue 跳到 step 之前
                 self.lower_stmt(body);
+                self.break_targets.pop();
+                self.continue_targets.pop();
+                self.body.push(Instr::Label(cont));
                 if let Some(st) = step {
                     let _ = self.lower_expr(st);
                 }
@@ -241,6 +253,69 @@ impl<'a> Lowerer<'a> {
                 self.body.push(Instr::Label(end));
                 self.pop_scope();
             }
+            Stmt::Break => {
+                if let Some(&t) = self.break_targets.last() {
+                    self.body.push(Instr::Jump(t));
+                }
+            }
+            Stmt::Continue => {
+                if let Some(&t) = self.continue_targets.last() {
+                    self.body.push(Instr::Jump(t));
+                }
+            }
+            Stmt::Switch { cond, body } => {
+                let (c, _) = self.lower_expr(cond);
+                let end = self.new_label();
+                // 给每个 case/default 分配标签
+                let item_labels: Vec<Option<usize>> = body
+                    .iter()
+                    .map(|s| match s {
+                        Stmt::Case(_) | Stmt::Default => Some(self.new_label()),
+                        _ => None,
+                    })
+                    .collect();
+                // 分发：c != v 为零（即相等）时跳到对应 case
+                let mut default_label = None;
+                for (item, lbl) in body.iter().zip(item_labels.iter()) {
+                    match item {
+                        Stmt::Case(v) => {
+                            let tv = self.fresh();
+                            self.body.push(Instr::Const { dst: tv, value: *v });
+                            let ne = self.fresh();
+                            self.body.push(Instr::Bin {
+                                dst: ne,
+                                op: BinOp::Ne,
+                                lhs: c,
+                                rhs: tv,
+                            });
+                            self.body.push(Instr::JumpIfZero {
+                                cond: ne,
+                                target: lbl.unwrap(),
+                            });
+                        }
+                        Stmt::Default => default_label = *lbl,
+                        _ => {}
+                    }
+                }
+                match default_label {
+                    Some(d) => self.body.push(Instr::Jump(d)),
+                    None => self.body.push(Instr::Jump(end)),
+                }
+                // 函数体（case/default 处放标签，break 跳到 end）
+                self.break_targets.push(end);
+                for (item, lbl) in body.iter().zip(item_labels.iter()) {
+                    match item {
+                        Stmt::Case(_) | Stmt::Default => {
+                            self.body.push(Instr::Label(lbl.unwrap()));
+                        }
+                        other => self.lower_stmt(other),
+                    }
+                }
+                self.break_targets.pop();
+                self.body.push(Instr::Label(end));
+            }
+            // case/default 在 switch 外无意义（由 Switch 处理），单独出现时忽略
+            Stmt::Case(_) | Stmt::Default => {}
         }
     }
 
@@ -654,6 +729,8 @@ fn lower_func(
         strings,
         aggregates,
         signatures,
+        break_targets: Vec::new(),
+        continue_targets: Vec::new(),
     };
     // 参数占据前若干槽，从入参寄存器直接落到各自槽位。
     for (index, (pname, pty)) in f.params.iter().enumerate() {

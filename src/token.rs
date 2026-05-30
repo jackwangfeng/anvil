@@ -65,6 +65,11 @@ pub enum TokenKind {
     KwTypedef,
     KwVoid,
     KwConst,
+    KwBreak,
+    KwContinue,
+    KwSwitch,
+    KwCase,
+    KwDefault,
     Eof,
 }
 
