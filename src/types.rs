@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
+    Void,
     Int,
     Char,
     Pointer(Box<Type>),
@@ -13,6 +14,7 @@ pub enum Type {
 impl Type {
     pub fn size(&self) -> usize {
         match self {
+            Type::Void => 0,
             Type::Int => 4,
             Type::Char => 1,
             Type::Pointer(_) => 8,
@@ -59,6 +61,16 @@ pub struct Aggregate {
 }
 
 pub type Aggregates = HashMap<String, Aggregate>;
+
+/// 函数签名（来自定义或原型声明）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signature {
+    pub ret: Type,
+    pub fixed: usize,
+    pub variadic: bool,
+}
+
+pub type Signatures = HashMap<String, Signature>;
 
 /// 带聚合体注册表的大小计算。
 pub fn size_of(ty: &Type, aggs: &Aggregates) -> usize {
