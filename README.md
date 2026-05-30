@@ -1,4 +1,4 @@
-# bianyi
+# anvil
 
 用 **Rust 从头手写**的一个 C 编译器，直接生成 **AArch64（Apple Silicon）汇编**，再调用系统 `clang` 汇编链接成原生可执行文件。
 
@@ -26,7 +26,7 @@ int main() {
 ```
 
 ```
-$ bianyi demo.c -o demo && ./demo
+$ anvil demo.c -o demo && ./demo
 OK total=12 half=6.000000
 $ echo $?
 12
@@ -57,14 +57,14 @@ $ echo $?
 
 ```bash
 cargo build --release
-./target/release/bianyi program.c -o program
+./target/release/anvil program.c -o program
 ./program
 ```
 
 运行测试：
 
 ```bash
-cargo test     # 137 个测试：单元测试 + "编译并运行" 端到端测试
+cargo test     # 138 个测试：单元测试 + "编译并运行" 端到端测试
 ```
 
 ## 支持的 C 特性

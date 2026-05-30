@@ -1,12 +1,12 @@
 [package]
-name = "bianyi"
+name = "anvil"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "bianyi"
+name = "anvil"
 path = "src/lib.rs"
 
 [[bin]]
-name = "bianyi"
+name = "anvil"
 path = "src/main.rs"

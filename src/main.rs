@@ -1,5 +1,5 @@
-use bianyi::compile_to_asm;
-use bianyi::preprocess::preprocess;
+use anvil::compile_to_asm;
+use anvil::preprocess::preprocess;
 use std::path::Path;
 use std::process::{exit, Command};
 
@@ -87,7 +87,7 @@ fn parse_args(args: &[String]) -> Result<(String, String), String> {
         }
         i += 1;
     }
-    let input = input.ok_or_else(|| "usage: bianyi <input.c> [-o output]".to_string())?;
+    let input = input.ok_or_else(|| "usage: anvil <input.c> [-o output]".to_string())?;
     let output = output.unwrap_or_else(|| {
         Path::new(&input)
             .file_stem()

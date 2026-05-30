@@ -1,20 +1,20 @@
 use std::process::Command;
 
-/// 用 bianyi 编译 `src`，运行产物，返回其退出码。
+/// 用 anvil 编译 `src`，运行产物，返回其退出码。
 fn compile_and_run(src: &str, name: &str) -> i32 {
     let dir = std::env::temp_dir();
     let c_path = dir.join(format!("{}.c", name));
     let exe_path = dir.join(name);
     std::fs::write(&c_path, src).expect("write .c");
 
-    let bin = env!("CARGO_BIN_EXE_bianyi");
+    let bin = env!("CARGO_BIN_EXE_anvil");
     let compile = Command::new(bin)
         .arg(&c_path)
         .arg("-o")
         .arg(&exe_path)
         .status()
-        .expect("run bianyi");
-    assert!(compile.success(), "bianyi failed to compile {}", name);
+        .expect("run anvil");
+    assert!(compile.success(), "anvil failed to compile {}", name);
 
     let run = Command::new(&exe_path).status().expect("run compiled exe");
     run.code().expect("program terminated by signal")
@@ -26,14 +26,14 @@ fn compile_run_capture(src: &str, name: &str) -> (i32, String) {
     let c_path = dir.join(format!("{}.c", name));
     let exe_path = dir.join(name);
     std::fs::write(&c_path, src).expect("write .c");
-    let bin = env!("CARGO_BIN_EXE_bianyi");
+    let bin = env!("CARGO_BIN_EXE_anvil");
     let compile = Command::new(bin)
         .arg(&c_path)
         .arg("-o")
         .arg(&exe_path)
         .status()
-        .expect("run bianyi");
-    assert!(compile.success(), "bianyi failed to compile {}", name);
+        .expect("run anvil");
+    assert!(compile.success(), "anvil failed to compile {}", name);
     let out = Command::new(&exe_path).output().expect("run compiled exe");
     let code = out.status.code().expect("terminated by signal");
     (code, String::from_utf8_lossy(&out.stdout).to_string())
