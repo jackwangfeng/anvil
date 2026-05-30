@@ -56,6 +56,18 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::KwInt)?;
         let name = self.expect_ident()?;
         self.expect(&TokenKind::LParen)?;
+        let mut params = Vec::new();
+        if *self.peek_kind() != TokenKind::RParen {
+            loop {
+                self.expect(&TokenKind::KwInt)?;
+                params.push(self.expect_ident()?);
+                if *self.peek_kind() == TokenKind::Comma {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+        }
         self.expect(&TokenKind::RParen)?;
         self.expect(&TokenKind::LBrace)?;
         let mut body = Vec::new();
@@ -63,7 +75,7 @@ impl<'a> Parser<'a> {
             body.push(self.parse_stmt()?);
         }
         self.expect(&TokenKind::RBrace)?;
-        Ok(FuncDef { name, body })
+        Ok(FuncDef { name, params, body })
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, CompileError> {
@@ -249,10 +261,32 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Ok(Expr::IntLit(v))
             }
+            TokenKind::StrLit(s) => {
+                let s = s.clone();
+                self.pos += 1;
+                Ok(Expr::StrLit(s))
+            }
             TokenKind::Ident(name) => {
                 let name = name.clone();
                 self.pos += 1;
-                Ok(Expr::Var(name))
+                if *self.peek_kind() == TokenKind::LParen {
+                    self.pos += 1; // 吃 '('
+                    let mut args = Vec::new();
+                    if *self.peek_kind() != TokenKind::RParen {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if *self.peek_kind() == TokenKind::Comma {
+                                self.pos += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(Expr::Call { name, args })
+                } else {
+                    Ok(Expr::Var(name))
+                }
             }
             TokenKind::LParen => {
                 self.pos += 1;
@@ -307,6 +341,38 @@ mod tests {
             .next()
             .unwrap()
             .body
+    }
+
+    #[test]
+    fn parse_function_with_params() {
+        let prog = parse(&lex("int add(int a, int b){ return a+b; }").unwrap()).unwrap();
+        let f = &prog.functions[0];
+        assert_eq!(f.name, "add");
+        assert_eq!(f.params, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parse_call_expr() {
+        let e = parse_return_expr("int main(){ return add(1, 2); }");
+        assert_eq!(
+            e,
+            Expr::Call {
+                name: "add".to_string(),
+                args: vec![Expr::IntLit(1), Expr::IntLit(2)],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_string_arg() {
+        let body = parse_body("int main(){ puts(\"hi\"); return 0; }");
+        match &body[0] {
+            Stmt::ExprStmt(Expr::Call { name, args }) => {
+                assert_eq!(name, "puts");
+                assert_eq!(args, &vec![Expr::StrLit("hi".to_string())]);
+            }
+            other => panic!("expected call stmt, got {:?}", other),
+        }
     }
 
     #[test]

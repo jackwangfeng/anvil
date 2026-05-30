@@ -7,6 +7,7 @@ pub type Temp = usize;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub functions: Vec<Function>,
+    pub strings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +28,9 @@ pub enum Instr {
     Label(usize),
     Jump(usize),
     JumpIfZero { cond: Temp, target: usize },
+    Call { dst: Temp, name: String, args: Vec<Temp> },
+    StrLit { dst: Temp, index: usize },
+    LoadArg { dst: Temp, index: usize },
     Return { src: Temp },
 }
 
@@ -46,19 +50,24 @@ pub enum BinOp {
 }
 
 pub fn lower(ast: &AstProgram) -> Program {
-    Program {
-        functions: ast.functions.iter().map(lower_func).collect(),
-    }
+    let mut strings = Vec::new();
+    let functions = ast
+        .functions
+        .iter()
+        .map(|f| lower_func(f, &mut strings))
+        .collect();
+    Program { functions, strings }
 }
 
-struct Lowerer {
+struct Lowerer<'a> {
     body: Vec<Instr>,
     next_temp: usize,
     scopes: Vec<HashMap<String, Temp>>,
     next_label: usize,
+    strings: &'a mut Vec<String>,
 }
 
-impl Lowerer {
+impl<'a> Lowerer<'a> {
     fn fresh(&mut self) -> Temp {
         let t = self.next_temp;
         self.next_temp += 1;
@@ -203,6 +212,23 @@ impl Lowerer {
                 self.body.push(Instr::Load { dst, var: slot });
                 dst
             }
+            Expr::StrLit(s) => {
+                let index = self.strings.len();
+                self.strings.push(s.clone());
+                let dst = self.fresh();
+                self.body.push(Instr::StrLit { dst, index });
+                dst
+            }
+            Expr::Call { name, args } => {
+                let arg_temps: Vec<Temp> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let dst = self.fresh();
+                self.body.push(Instr::Call {
+                    dst,
+                    name: name.clone(),
+                    args: arg_temps,
+                });
+                dst
+            }
             Expr::Assign { name, value } => {
                 let v = self.lower_expr(value);
                 let slot = self.lookup_var(name).expect("undeclared variable");
@@ -252,13 +278,19 @@ fn lower_binop(op: BinaryOp) -> BinOp {
     }
 }
 
-fn lower_func(f: &FuncDef) -> Function {
+fn lower_func(f: &FuncDef, strings: &mut Vec<String>) -> Function {
     let mut lw = Lowerer {
         body: Vec::new(),
         next_temp: 0,
         scopes: vec![HashMap::new()],
         next_label: 0,
+        strings,
     };
+    // 参数占据前 N 个槽，并从入参寄存器载入
+    for (index, p) in f.params.iter().enumerate() {
+        let slot = lw.declare_var(p);
+        lw.body.push(Instr::LoadArg { dst: slot, index });
+    }
     for stmt in &f.body {
         lw.lower_stmt(stmt);
     }
@@ -279,6 +311,35 @@ mod tests {
         let ast = parse(&lex(src).unwrap()).unwrap();
         let ir = lower(&ast);
         ir.functions.into_iter().next().unwrap()
+    }
+
+    fn lower_prog(src: &str) -> Program {
+        lower(&parse(&lex(src).unwrap()).unwrap())
+    }
+
+    #[test]
+    fn lower_call_and_string() {
+        let p = lower_prog("int main(){ puts(\"hi\"); return 0; }");
+        assert_eq!(p.strings, vec!["hi".to_string()]);
+        let f = &p.functions[0];
+        let has_strlit = f.body.iter().any(|i| matches!(i, Instr::StrLit { index: 0, .. }));
+        let has_call = f
+            .body
+            .iter()
+            .any(|i| matches!(i, Instr::Call { name, .. } if name == "puts"));
+        assert!(has_strlit && has_call);
+    }
+
+    #[test]
+    fn lower_params_emit_loadarg() {
+        let p = lower_prog("int add(int a, int b){ return a+b; } int main(){ return add(1,2); }");
+        let add = p.functions.iter().find(|f| f.name == "add").unwrap();
+        let loadargs = add
+            .body
+            .iter()
+            .filter(|i| matches!(i, Instr::LoadArg { .. }))
+            .count();
+        assert_eq!(loadargs, 2, "two params -> two LoadArg");
     }
 
     #[test]
