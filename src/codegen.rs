@@ -8,7 +8,33 @@ pub fn generate(program: &Program) -> String {
         gen_func(func, &mut out);
     }
     gen_strings(&program.strings, &mut out);
+    gen_globals(&program.globals, &mut out);
     out
+}
+
+fn gen_globals(globals: &[crate::ir::GlobalVar], out: &mut String) {
+    if globals.is_empty() {
+        return;
+    }
+    out.push_str(".section __DATA,__data\n");
+    for g in globals {
+        out.push_str(".globl _");
+        out.push_str(&g.name);
+        out.push('\n');
+        out.push_str(".p2align 3\n");
+        let _ = writeln!(out, "_{}:", g.name);
+        match (g.init, g.size) {
+            (Some(v), 8) => {
+                let _ = writeln!(out, "    .quad {}", v);
+            }
+            (Some(v), _) => {
+                let _ = writeln!(out, "    .long {}", v);
+            }
+            (None, n) => {
+                let _ = writeln!(out, "    .zero {}", n.max(1));
+            }
+        }
+    }
 }
 
 /// 槽位即帧内字节偏移。
@@ -72,17 +98,30 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*cond));
             let _ = writeln!(out, "    cbz w9, L{}_{}", func, target);
         }
-        Instr::LoadArg { dst, index, width } => match *width {
-            8 => {
-                let _ = writeln!(out, "    str x{}, [sp, #{}]", index, slot(*dst));
+        Instr::LoadArg { dst, index, width } => {
+            if *index < 8 {
+                match *width {
+                    8 => {
+                        let _ = writeln!(out, "    str x{}, [sp, #{}]", index, slot(*dst));
+                    }
+                    1 => {
+                        let _ = writeln!(out, "    strb w{}, [sp, #{}]", index, slot(*dst));
+                    }
+                    _ => {
+                        let _ = writeln!(out, "    str w{}, [sp, #{}]", index, slot(*dst));
+                    }
+                }
+            } else {
+                // 第 9+ 个参数：调用方放在栈上，位于 [x29 + 16 + (index-8)*8]
+                let off = 16 + (index - 8) * 8;
+                let _ = writeln!(out, "    ldr x9, [x29, #{}]", off);
+                if *width == 8 {
+                    let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+                } else {
+                    let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
+                }
             }
-            1 => {
-                let _ = writeln!(out, "    strb w{}, [sp, #{}]", index, slot(*dst));
-            }
-            _ => {
-                let _ = writeln!(out, "    str w{}, [sp, #{}]", index, slot(*dst));
-            }
-        },
+        }
         Instr::StrLit { dst, index } => {
             let _ = writeln!(out, "    adrp x9, L_.str.{}@PAGE", index);
             let _ = writeln!(out, "    add x9, x9, L_.str.{}@PAGEOFF", index);
@@ -90,6 +129,11 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
         }
         Instr::AddrOf { dst, off } => {
             let _ = writeln!(out, "    add x9, sp, #{}", off);
+            let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
+        Instr::GlobalAddr { dst, name } => {
+            let _ = writeln!(out, "    adrp x9, _{}@PAGE", name);
+            let _ = writeln!(out, "    add x9, x9, _{}@PAGEOFF", name);
             let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
         }
         Instr::FieldAddr { dst, base, offset } => {
@@ -146,25 +190,25 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
         }
         Instr::Call { dst, name, args, ret_width, fixed, variadic } => {
-            if *variadic && args.len() > *fixed {
-                // Apple AArch64：可变参数走栈，每个 8 字节，从 sp 起步；固定参数仍走寄存器。
-                let nvar = args.len() - *fixed;
-                let space = (nvar * 8).div_ceil(16) * 16;
+            // 寄存器可容纳的参数数：可变参数函数下，仅固定参数进寄存器（≤8）；否则前 8 个进寄存器。
+            let nreg = if *variadic { (*fixed).min(8) } else { args.len().min(8) };
+            let stack_args = &args[nreg..];
+            let space = (stack_args.len() * 8).div_ceil(16) * 16;
+            if space > 0 {
                 let _ = writeln!(out, "    sub sp, sp, #{}", space);
-                for (k, a) in args.iter().skip(*fixed).enumerate() {
-                    let _ = writeln!(out, "    ldr x9, [sp, #{}]", space + slot(*a));
-                    let _ = writeln!(out, "    str x9, [sp, #{}]", k * 8);
-                }
-                for (i, a) in args.iter().take(*fixed).enumerate() {
-                    let _ = writeln!(out, "    ldr x{}, [sp, #{}]", i, space + slot(*a));
-                }
-                let _ = writeln!(out, "    bl _{}", name);
+            }
+            // 栈传参（含可变参数与第 9+ 个参数），每个 8 字节，从 sp 起步
+            for (k, a) in stack_args.iter().enumerate() {
+                let _ = writeln!(out, "    ldr x9, [sp, #{}]", space + slot(*a));
+                let _ = writeln!(out, "    str x9, [sp, #{}]", k * 8);
+            }
+            // 寄存器参数 x0..x{nreg-1}
+            for (i, a) in args.iter().take(nreg).enumerate() {
+                let _ = writeln!(out, "    ldr x{}, [sp, #{}]", i, space + slot(*a));
+            }
+            let _ = writeln!(out, "    bl _{}", name);
+            if space > 0 {
                 let _ = writeln!(out, "    add sp, sp, #{}", space);
-            } else {
-                for (i, a) in args.iter().enumerate() {
-                    let _ = writeln!(out, "    ldr x{}, [sp, #{}]", i, slot(*a));
-                }
-                let _ = writeln!(out, "    bl _{}", name);
             }
             if *ret_width == 8 {
                 let _ = writeln!(out, "    str x0, [sp, #{}]", slot(*dst));
@@ -233,6 +277,7 @@ mod tests {
                 frame_bytes,
             }],
             strings: vec![],
+            globals: vec![],
         })
     }
 
@@ -344,6 +389,7 @@ mod tests {
                 frame_bytes: 16,
             }],
             strings: vec![],
+            globals: vec![],
         });
         assert!(asm.contains("str w0, [sp, #0]"));
         assert!(asm.contains("ldr x0, [sp, #0]"));
@@ -362,6 +408,7 @@ mod tests {
                 frame_bytes: 8,
             }],
             strings: vec!["Hi".to_string()],
+            globals: vec![],
         });
         assert!(asm.contains("adrp x9, L_.str.0@PAGE"));
         assert!(asm.contains("add x9, x9, L_.str.0@PAGEOFF"));
@@ -384,6 +431,7 @@ mod tests {
                 frame_bytes: 8,
             }],
             strings: vec![],
+            globals: vec![],
         });
         assert!(asm.contains("Lmain_0:"));
         assert!(asm.contains("b Lmain_0"));
@@ -398,6 +446,7 @@ mod tests {
                 frame_bytes: 16,
             }],
             strings: vec![],
+            globals: vec![],
         });
         assert!(asm.contains("add x9, sp, #0"));
         assert!(asm.contains("str x9, [sp, #8]"));
@@ -417,6 +466,7 @@ mod tests {
                 frame_bytes: 24,
             }],
             strings: vec![],
+            globals: vec![],
         });
         assert!(asm.contains("ldr w10, [x9]"));
         assert!(asm.contains("ldrsb w10, [x9]"));
@@ -436,6 +486,7 @@ mod tests {
                 frame_bytes: 16,
             }],
             strings: vec![],
+            globals: vec![],
         });
         assert!(asm.contains("add x9, x9, #8"));
     }
@@ -452,6 +503,7 @@ mod tests {
                 frame_bytes: 24,
             }],
             strings: vec![],
+            globals: vec![],
         });
         assert!(asm.contains("add x9, x9, w10, sxtw #2"));
     }

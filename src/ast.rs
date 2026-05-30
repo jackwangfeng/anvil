@@ -5,6 +5,14 @@ pub struct Program {
     pub functions: Vec<FuncDef>,
     pub aggregates: Aggregates,
     pub signatures: Signatures,
+    pub globals: Vec<Global>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Global {
+    pub name: String,
+    pub ty: Type,
+    pub init: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

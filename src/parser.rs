@@ -1,4 +1,4 @@
-use crate::ast::{BinaryOp, Expr, FuncDef, LogOp, Program, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, Expr, FuncDef, Global, LogOp, Program, Stmt, UnaryOp};
 use crate::error::CompileError;
 use crate::token::{Token, TokenKind};
 use crate::types::{Aggregate, Aggregates, Field, Signature, Signatures, Type};
@@ -12,6 +12,8 @@ pub fn parse(tokens: &[Token]) -> Result<Program, CompileError> {
         typedefs: HashMap::new(),
         enum_consts: HashMap::new(),
         signatures: HashMap::new(),
+        globals: Vec::new(),
+        global_types: HashMap::new(),
         anon_counter: 0,
     };
     p.parse_program()
@@ -24,6 +26,8 @@ struct Parser<'a> {
     typedefs: HashMap<String, Type>,
     enum_consts: HashMap<String, i64>,
     signatures: Signatures,
+    globals: Vec<Global>,
+    global_types: HashMap<String, Type>,
     anon_counter: usize,
 }
 
@@ -85,6 +89,7 @@ impl<'a> Parser<'a> {
             functions,
             aggregates: self.aggregates.clone(),
             signatures: self.signatures.clone(),
+            globals: std::mem::take(&mut self.globals),
         })
     }
 
@@ -277,6 +282,43 @@ impl<'a> Parser<'a> {
             CompileError::new(self.tokens[self.pos].span, "expected return type".to_string())
         })?;
         let name = self.expect_ident()?;
+        // 非 '(' → 全局变量声明
+        if *self.peek_kind() != TokenKind::LParen {
+            let mut ty = ret;
+            if *self.peek_kind() == TokenKind::LBracket {
+                self.pos += 1;
+                let n = match self.peek_kind() {
+                    TokenKind::IntLit(v) => *v as usize,
+                    _ => {
+                        return Err(CompileError::new(
+                            self.tokens[self.pos].span,
+                            "expected array size".to_string(),
+                        ))
+                    }
+                };
+                self.pos += 1;
+                self.expect(&TokenKind::RBracket)?;
+                ty = Type::Array(Box::new(ty), n);
+            }
+            let mut init = None;
+            if *self.peek_kind() == TokenKind::Assign {
+                self.pos += 1;
+                let e = self.parse_expr()?;
+                match e {
+                    Expr::IntLit(v) => init = Some(v),
+                    _ => {
+                        return Err(CompileError::new(
+                            self.tokens[self.pos].span,
+                            "global initializer must be an integer constant".to_string(),
+                        ))
+                    }
+                }
+            }
+            self.expect(&TokenKind::Semicolon)?;
+            self.global_types.insert(name.clone(), ty.clone());
+            self.globals.push(Global { name, ty, init });
+            return Ok(None);
+        }
         self.expect(&TokenKind::LParen)?;
         let mut params = Vec::new();
         let mut variadic = false;
