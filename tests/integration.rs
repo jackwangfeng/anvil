@@ -382,7 +382,8 @@ fn m8_bitwise() {
 
 #[test]
 fn m8_not_and_bitnot() {
-    assert_eq!(compile_and_run("int main(){ return !0 + !5 + (~0 & 1); }", "m8_not"), 1 + 0 + 1);
+    // !0=1, !5=0, (~0 & 1)=1  => 2
+    assert_eq!(compile_and_run("int main(){ return !0 + !5 + (~0 & 1); }", "m8_not"), 2);
 }
 
 #[test]
@@ -395,5 +396,53 @@ fn m8_incdec_and_compound() {
     assert_eq!(
         compile_and_run("int main(){ int s=0; for(int i=0;i<5;i++){ s += i; } return s; }", "m8_incr"),
         10
+    );
+}
+
+#[test]
+fn m9_break_in_for() {
+    assert_eq!(
+        compile_and_run("int main(){ int s=0; for(int i=0;i<10;i++){ if(i==5) break; s+=i; } return s; }", "m9_break"),
+        10
+    );
+}
+
+#[test]
+fn m9_continue_in_for() {
+    assert_eq!(
+        compile_and_run("int main(){ int s=0; for(int i=0;i<5;i++){ if(i==2) continue; s+=i; } return s; }", "m9_cont"),
+        8
+    );
+}
+
+#[test]
+fn m9_switch_break() {
+    assert_eq!(
+        compile_and_run("int main(){ int x=2; int r=0; switch(x){ case 1: r=10; break; case 2: r=20; break; default: r=99; } return r; }", "m9_switch"),
+        20
+    );
+}
+
+#[test]
+fn m9_switch_default() {
+    assert_eq!(
+        compile_and_run("int main(){ int x=7; int r=0; switch(x){ case 1: r=10; break; default: r=99; } return r; }", "m9_default"),
+        99
+    );
+}
+
+#[test]
+fn m9_switch_fallthrough() {
+    assert_eq!(
+        compile_and_run("int main(){ int r=0; switch(1){ case 1: r+=1; case 2: r+=10; break; case 3: r+=100; } return r; }", "m9_fall"),
+        11
+    );
+}
+
+#[test]
+fn m9_while_break() {
+    assert_eq!(
+        compile_and_run("int main(){ int i=0; while(1){ i++; if(i>=42) break; } return i; }", "m9_while_break"),
+        42
     );
 }

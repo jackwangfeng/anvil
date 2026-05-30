@@ -345,7 +345,37 @@ impl<'a> Parser<'a> {
             TokenKind::KwIf => return self.parse_if(),
             TokenKind::KwWhile => return self.parse_while(),
             TokenKind::KwFor => return self.parse_for(),
+            TokenKind::KwSwitch => return self.parse_switch(),
             TokenKind::LBrace => return self.parse_block(),
+            TokenKind::KwBreak => {
+                self.pos += 1;
+                self.expect(&TokenKind::Semicolon)?;
+                return Ok(Stmt::Break);
+            }
+            TokenKind::KwContinue => {
+                self.pos += 1;
+                self.expect(&TokenKind::Semicolon)?;
+                return Ok(Stmt::Continue);
+            }
+            TokenKind::KwCase => {
+                self.pos += 1;
+                let e = self.parse_expr()?;
+                self.expect(&TokenKind::Colon)?;
+                match e {
+                    Expr::IntLit(v) => return Ok(Stmt::Case(v)),
+                    _ => {
+                        return Err(CompileError::new(
+                            self.tokens[self.pos].span,
+                            "case label must be an integer constant".to_string(),
+                        ))
+                    }
+                }
+            }
+            TokenKind::KwDefault => {
+                self.pos += 1;
+                self.expect(&TokenKind::Colon)?;
+                return Ok(Stmt::Default);
+            }
             TokenKind::Semicolon => {
                 self.pos += 1;
                 return Ok(Stmt::Empty);
@@ -358,6 +388,20 @@ impl<'a> Parser<'a> {
         let e = self.parse_expr()?;
         self.expect(&TokenKind::Semicolon)?;
         Ok(Stmt::ExprStmt(e))
+    }
+
+    fn parse_switch(&mut self) -> Result<Stmt, CompileError> {
+        self.expect(&TokenKind::KwSwitch)?;
+        self.expect(&TokenKind::LParen)?;
+        let cond = self.parse_expr()?;
+        self.expect(&TokenKind::RParen)?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut body = Vec::new();
+        while *self.peek_kind() != TokenKind::RBrace {
+            body.push(self.parse_stmt()?);
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Stmt::Switch { cond, body })
     }
 
     fn parse_return(&mut self) -> Result<Stmt, CompileError> {

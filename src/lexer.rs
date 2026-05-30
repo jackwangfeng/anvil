@@ -269,6 +269,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     "typedef" => TokenKind::KwTypedef,
                     "void" => TokenKind::KwVoid,
                     "const" => TokenKind::KwConst,
+                    "break" => TokenKind::KwBreak,
+                    "continue" => TokenKind::KwContinue,
+                    "switch" => TokenKind::KwSwitch,
+                    "case" => TokenKind::KwCase,
+                    "default" => TokenKind::KwDefault,
                     _ => TokenKind::Ident(ident),
                 };
                 tokens.push(Token { kind, span: Span::new(line, start_col) });
