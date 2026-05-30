@@ -274,3 +274,48 @@ fn m5_union() {
         65
     );
 }
+
+#[test]
+fn m6_object_macro() {
+    assert_eq!(compile_and_run("#define N 42\nint main(){ return N; }", "m6_obj"), 42);
+}
+
+#[test]
+fn m6_function_macro() {
+    assert_eq!(
+        compile_and_run("#define ADD(a,b) ((a)+(b))\nint main(){ return ADD(40, 2); }", "m6_func"),
+        42
+    );
+}
+
+#[test]
+fn m6_conditional() {
+    assert_eq!(
+        compile_and_run(
+            "#define MAX 5\n#if MAX > 3\nint main(){ return 7; }\n#else\nint main(){ return 0; }\n#endif",
+            "m6_cond"
+        ),
+        7
+    );
+}
+
+#[test]
+fn m6_ifndef_guard() {
+    // 经典 include guard 风格：定义后再 ifdef 不应重复
+    assert_eq!(
+        compile_and_run("#ifndef X\n#define X\nint main(){ return 5; }\n#endif", "m6_guard"),
+        5
+    );
+}
+
+#[test]
+fn m6_include() {
+    // #include 解析相对 .c 文件所在目录；把头文件也写到 temp_dir
+    let dir = std::env::temp_dir();
+    std::fs::write(dir.join("m6_hdr.h"), "#define SECRET 42\nint helper(){ return SECRET; }\n")
+        .expect("write header");
+    assert_eq!(
+        compile_and_run("#include \"m6_hdr.h\"\nint main(){ return helper(); }", "m6_use_include"),
+        42
+    );
+}

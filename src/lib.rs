@@ -5,6 +5,7 @@ pub mod error;
 pub mod ir;
 pub mod lexer;
 pub mod parser;
+pub mod preprocess;
 pub mod span;
 pub mod token;
 pub mod types;

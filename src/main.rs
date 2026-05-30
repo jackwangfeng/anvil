@@ -1,4 +1,5 @@
 use bianyi::compile_to_asm;
+use bianyi::preprocess::preprocess;
 use std::path::Path;
 use std::process::{exit, Command};
 
@@ -20,7 +21,16 @@ fn main() {
         }
     };
 
-    let asm = match compile_to_asm(&src) {
+    let base_dir = Path::new(&input).parent().unwrap_or(Path::new("."));
+    let preprocessed = match preprocess(&src, base_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}:{}", input, e);
+            exit(1);
+        }
+    };
+
+    let asm = match compile_to_asm(&preprocessed) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{}:{}", input, e);
