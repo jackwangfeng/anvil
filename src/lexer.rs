@@ -21,8 +21,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 line += 1;
                 col = 1;
             }
-            '(' | ')' | '{' | '}' | ';' | '+' | '*' | '/' | '%' | ',' | '&' | '[' | ']'
-            | '.' => {
+            '(' | ')' | '{' | '}' | ';' | '+' | '*' | '/' | '%' | ',' | '&' | '[' | ']' => {
                 let kind = match c {
                     '(' => TokenKind::LParen,
                     ')' => TokenKind::RParen,
@@ -37,12 +36,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     '&' => TokenKind::Amp,
                     '[' => TokenKind::LBracket,
                     ']' => TokenKind::RBracket,
-                    '.' => TokenKind::Dot,
                     _ => unreachable!(),
                 };
                 tokens.push(Token { kind, span: Span::new(line, col) });
                 i += 1;
                 col += 1;
+            }
+            '.' => {
+                if i + 2 < chars.len() && chars[i + 1] == '.' && chars[i + 2] == '.' {
+                    tokens.push(Token { kind: TokenKind::Ellipsis, span: Span::new(line, col) });
+                    i += 3;
+                    col += 3;
+                } else {
+                    tokens.push(Token { kind: TokenKind::Dot, span: Span::new(line, col) });
+                    i += 1;
+                    col += 1;
+                }
             }
             '-' => {
                 if i + 1 < chars.len() && chars[i + 1] == '>' {
@@ -194,6 +203,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     "union" => TokenKind::KwUnion,
                     "enum" => TokenKind::KwEnum,
                     "typedef" => TokenKind::KwTypedef,
+                    "void" => TokenKind::KwVoid,
+                    "const" => TokenKind::KwConst,
                     _ => TokenKind::Ident(ident),
                 };
                 tokens.push(Token { kind, span: Span::new(line, start_col) });

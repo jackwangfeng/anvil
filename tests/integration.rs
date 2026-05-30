@@ -319,3 +319,50 @@ fn m6_include() {
         42
     );
 }
+
+#[test]
+fn m7_printf_int() {
+    let (code, out) = compile_run_capture(
+        "int printf(const char*, ...); int main(){ printf(\"v=%d\\n\", 42); return 0; }",
+        "m7_printf_int",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "v=42\n");
+}
+
+#[test]
+fn m7_printf_multi() {
+    let (_c, out) = compile_run_capture(
+        "int printf(const char*, ...); int main(){ printf(\"%d %d %d\\n\", 11, 22, 33); return 0; }",
+        "m7_printf_multi",
+    );
+    assert_eq!(out, "11 22 33\n");
+}
+
+#[test]
+fn m7_printf_string() {
+    let (_c, out) = compile_run_capture(
+        "int printf(const char*, ...); int main(){ printf(\"hi %s!\\n\", \"bob\"); return 0; }",
+        "m7_printf_string",
+    );
+    assert_eq!(out, "hi bob!\n");
+}
+
+#[test]
+fn m7_malloc_pointer_return() {
+    let (code, out) = compile_run_capture(
+        "void* malloc(int); int printf(const char*, ...); int main(){ char* p = malloc(8); p[0]=65; p[1]=66; p[2]=0; printf(\"%s\\n\", p); return 0; }",
+        "m7_malloc",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "AB\n");
+}
+
+#[test]
+fn m7_fixed_arg_libc_still_works() {
+    // abs 返回 int，固定参数
+    assert_eq!(
+        compile_and_run("int abs(int); int main(){ return abs(0-9); }", "m7_abs"),
+        9
+    );
+}

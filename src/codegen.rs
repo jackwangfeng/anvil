@@ -136,12 +136,32 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             let _ = writeln!(out, "    sub x9, x9, w10, sxtw #{}", shift);
             let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
         }
-        Instr::Call { dst, name, args } => {
-            for (i, a) in args.iter().enumerate() {
-                let _ = writeln!(out, "    ldr x{}, [sp, #{}]", i, slot(*a));
+        Instr::Call { dst, name, args, ret_width, fixed, variadic } => {
+            if *variadic && args.len() > *fixed {
+                // Apple AArch64：可变参数走栈，每个 8 字节，从 sp 起步；固定参数仍走寄存器。
+                let nvar = args.len() - *fixed;
+                let space = (nvar * 8).div_ceil(16) * 16;
+                let _ = writeln!(out, "    sub sp, sp, #{}", space);
+                for (k, a) in args.iter().skip(*fixed).enumerate() {
+                    let _ = writeln!(out, "    ldr x9, [sp, #{}]", space + slot(*a));
+                    let _ = writeln!(out, "    str x9, [sp, #{}]", k * 8);
+                }
+                for (i, a) in args.iter().take(*fixed).enumerate() {
+                    let _ = writeln!(out, "    ldr x{}, [sp, #{}]", i, space + slot(*a));
+                }
+                let _ = writeln!(out, "    bl _{}", name);
+                let _ = writeln!(out, "    add sp, sp, #{}", space);
+            } else {
+                for (i, a) in args.iter().enumerate() {
+                    let _ = writeln!(out, "    ldr x{}, [sp, #{}]", i, slot(*a));
+                }
+                let _ = writeln!(out, "    bl _{}", name);
             }
-            let _ = writeln!(out, "    bl _{}", name);
-            let _ = writeln!(out, "    str w0, [sp, #{}]", slot(*dst));
+            if *ret_width == 8 {
+                let _ = writeln!(out, "    str x0, [sp, #{}]", slot(*dst));
+            } else {
+                let _ = writeln!(out, "    str w0, [sp, #{}]", slot(*dst));
+            }
         }
         Instr::Bin { dst, op, lhs, rhs } => {
             let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*lhs));
@@ -297,7 +317,14 @@ mod tests {
                 name: "main".to_string(),
                 body: vec![
                     Instr::LoadArg { dst: 0, index: 0, width: 4 },
-                    Instr::Call { dst: 8, name: "puts".to_string(), args: vec![0] },
+                    Instr::Call {
+                        dst: 8,
+                        name: "puts".to_string(),
+                        args: vec![0],
+                        ret_width: 4,
+                        fixed: 1,
+                        variadic: false,
+                    },
                     Instr::Return { src: 8 },
                 ],
                 frame_bytes: 16,

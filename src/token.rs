@@ -22,6 +22,7 @@ pub enum TokenKind {
     LBracket,
     RBracket,
     Dot,
+    Ellipsis,
     Arrow,
     Assign,
     Lt,
@@ -40,6 +41,8 @@ pub enum TokenKind {
     KwUnion,
     KwEnum,
     KwTypedef,
+    KwVoid,
+    KwConst,
     Eof,
 }
 

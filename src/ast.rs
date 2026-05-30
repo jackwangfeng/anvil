@@ -1,15 +1,17 @@
-use crate::types::{Aggregates, Type};
+use crate::types::{Aggregates, Signatures, Type};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub functions: Vec<FuncDef>,
     pub aggregates: Aggregates,
+    pub signatures: Signatures,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncDef {
     pub name: String,
     pub params: Vec<(String, Type)>,
+    pub ret: Type,
     pub body: Vec<Stmt>,
 }
 

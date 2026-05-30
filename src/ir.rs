@@ -1,5 +1,5 @@
 use crate::ast::{BinaryOp, Expr, FuncDef, Program as AstProgram, Stmt, UnaryOp};
-use crate::types::{Aggregates, Type};
+use crate::types::{Aggregates, Signatures, Type};
 use std::collections::HashMap;
 
 /// 帧内字节偏移（既是临时量，也是变量的存放位置）。
@@ -26,7 +26,14 @@ pub enum Instr {
     Label(usize),
     Jump(usize),
     JumpIfZero { cond: Temp, target: usize },
-    Call { dst: Temp, name: String, args: Vec<Temp> },
+    Call {
+        dst: Temp,
+        name: String,
+        args: Vec<Temp>,
+        ret_width: usize,
+        fixed: usize,
+        variadic: bool,
+    },
     StrLit { dst: Temp, index: usize },
     LoadArg { dst: Temp, index: usize, width: usize },
     AddrOf { dst: Temp, off: usize },
@@ -58,7 +65,7 @@ pub fn lower(ast: &AstProgram) -> Program {
     let functions = ast
         .functions
         .iter()
-        .map(|f| lower_func(f, &mut strings, &ast.aggregates))
+        .map(|f| lower_func(f, &mut strings, &ast.aggregates, &ast.signatures))
         .collect();
     Program { functions, strings }
 }
@@ -70,6 +77,7 @@ struct Lowerer<'a> {
     next_label: usize,
     strings: &'a mut Vec<String>,
     aggregates: &'a Aggregates,
+    signatures: &'a Signatures,
 }
 
 impl<'a> Lowerer<'a> {
@@ -360,12 +368,20 @@ impl<'a> Lowerer<'a> {
             Expr::Call { name, args } => {
                 let arg_temps: Vec<Temp> = args.iter().map(|a| self.lower_expr(a).0).collect();
                 let dst = self.fresh();
+                let sig = self.signatures.get(name);
+                let ret = sig.map(|s| s.ret.clone()).unwrap_or(Type::Int);
+                let ret_width = if matches!(ret, Type::Pointer(_)) { 8 } else { 4 };
+                let fixed = sig.map(|s| s.fixed).unwrap_or(arg_temps.len());
+                let variadic = sig.map(|s| s.variadic).unwrap_or(false);
                 self.body.push(Instr::Call {
                     dst,
                     name: name.clone(),
                     args: arg_temps,
+                    ret_width,
+                    fixed,
+                    variadic,
                 });
-                (dst, Type::Int)
+                (dst, ret)
             }
         }
     }
@@ -559,7 +575,12 @@ fn shift_of(size: usize) -> u32 {
     }
 }
 
-fn lower_func(f: &FuncDef, strings: &mut Vec<String>, aggregates: &Aggregates) -> Function {
+fn lower_func(
+    f: &FuncDef,
+    strings: &mut Vec<String>,
+    aggregates: &Aggregates,
+    signatures: &Signatures,
+) -> Function {
     let mut lw = Lowerer {
         body: Vec::new(),
         next_offset: 0,
@@ -567,6 +588,7 @@ fn lower_func(f: &FuncDef, strings: &mut Vec<String>, aggregates: &Aggregates) -
         next_label: 0,
         strings,
         aggregates,
+        signatures,
     };
     // 参数占据前若干槽，从入参寄存器直接落到各自槽位。
     for (index, (pname, pty)) in f.params.iter().enumerate() {

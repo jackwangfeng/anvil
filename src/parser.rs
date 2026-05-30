@@ -1,7 +1,7 @@
 use crate::ast::{BinaryOp, Expr, FuncDef, Program, Stmt, UnaryOp};
 use crate::error::CompileError;
 use crate::token::{Token, TokenKind};
-use crate::types::{Aggregate, Aggregates, Field, Type};
+use crate::types::{Aggregate, Aggregates, Field, Signature, Signatures, Type};
 use std::collections::HashMap;
 
 pub fn parse(tokens: &[Token]) -> Result<Program, CompileError> {
@@ -11,6 +11,7 @@ pub fn parse(tokens: &[Token]) -> Result<Program, CompileError> {
         aggregates: HashMap::new(),
         typedefs: HashMap::new(),
         enum_consts: HashMap::new(),
+        signatures: HashMap::new(),
         anon_counter: 0,
     };
     p.parse_program()
@@ -22,6 +23,7 @@ struct Parser<'a> {
     aggregates: Aggregates,
     typedefs: HashMap<String, Type>,
     enum_consts: HashMap<String, i64>,
+    signatures: Signatures,
     anon_counter: usize,
 }
 
@@ -72,12 +74,17 @@ impl<'a> Parser<'a> {
                 TokenKind::KwTypedef => {
                     self.parse_typedef()?;
                 }
-                _ => functions.push(self.parse_func_def()?),
+                _ => {
+                    if let Some(f) = self.parse_func_or_proto()? {
+                        functions.push(f);
+                    }
+                }
             }
         }
         Ok(Program {
             functions,
             aggregates: self.aggregates.clone(),
+            signatures: self.signatures.clone(),
         })
     }
 
@@ -89,6 +96,8 @@ impl<'a> Parser<'a> {
         match self.peek_kind() {
             TokenKind::KwInt
             | TokenKind::KwChar
+            | TokenKind::KwVoid
+            | TokenKind::KwConst
             | TokenKind::KwStruct
             | TokenKind::KwUnion
             | TokenKind::KwEnum => true,
@@ -195,7 +204,15 @@ impl<'a> Parser<'a> {
 
     /// 类型说明符：基础类型 / struct|union（含内联定义）/ enum / typedef 名，后跟 `*`。
     fn parse_type_specifier(&mut self) -> Option<Type> {
+        // 跳过前导 const 限定符
+        while *self.peek_kind() == TokenKind::KwConst {
+            self.pos += 1;
+        }
         let mut ty = match self.peek_kind() {
+            TokenKind::KwVoid => {
+                self.pos += 1;
+                Type::Void
+            }
             TokenKind::KwInt => {
                 self.pos += 1;
                 Type::Int
@@ -254,20 +271,39 @@ impl<'a> Parser<'a> {
         Some(ty)
     }
 
-    fn parse_func_def(&mut self) -> Result<FuncDef, CompileError> {
-        self.expect(&TokenKind::KwInt)?; // 返回类型当前固定 int
+    /// 解析函数定义或原型声明。原型返回 None（仅注册签名）。
+    fn parse_func_or_proto(&mut self) -> Result<Option<FuncDef>, CompileError> {
+        let ret = self.parse_type_specifier().ok_or_else(|| {
+            CompileError::new(self.tokens[self.pos].span, "expected return type".to_string())
+        })?;
         let name = self.expect_ident()?;
         self.expect(&TokenKind::LParen)?;
         let mut params = Vec::new();
-        if *self.peek_kind() != TokenKind::RParen {
+        let mut variadic = false;
+        if *self.peek_kind() == TokenKind::KwVoid
+            && self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(&TokenKind::RParen)
+        {
+            self.pos += 1; // (void) = 无参数
+        } else if *self.peek_kind() != TokenKind::RParen {
             loop {
+                if *self.peek_kind() == TokenKind::Ellipsis {
+                    self.pos += 1;
+                    variadic = true;
+                    break;
+                }
                 let ty = self.parse_type_specifier().ok_or_else(|| {
                     CompileError::new(
                         self.tokens[self.pos].span,
                         "expected parameter type".to_string(),
                     )
                 })?;
-                let pname = self.expect_ident()?;
+                let pname = if let TokenKind::Ident(n) = self.peek_kind() {
+                    let n = n.clone();
+                    self.pos += 1;
+                    n
+                } else {
+                    String::new()
+                };
                 params.push((pname, ty));
                 if *self.peek_kind() == TokenKind::Comma {
                     self.pos += 1;
@@ -277,13 +313,30 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&TokenKind::RParen)?;
+        self.signatures.insert(
+            name.clone(),
+            Signature {
+                ret: ret.clone(),
+                fixed: params.len(),
+                variadic,
+            },
+        );
+        if *self.peek_kind() == TokenKind::Semicolon {
+            self.pos += 1;
+            return Ok(None); // 原型
+        }
         self.expect(&TokenKind::LBrace)?;
         let mut body = Vec::new();
         while *self.peek_kind() != TokenKind::RBrace {
             body.push(self.parse_stmt()?);
         }
         self.expect(&TokenKind::RBrace)?;
-        Ok(FuncDef { name, params, body })
+        Ok(Some(FuncDef {
+            name,
+            params,
+            ret,
+            body,
+        }))
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, CompileError> {
