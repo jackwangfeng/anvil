@@ -281,6 +281,32 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
             }
             c if c.is_ascii_digit() => {
                 let start_col = col;
+                // 十六进制 (0x..) 与二进制 (0b..) 字面量
+                if c == '0'
+                    && i + 1 < chars.len()
+                    && matches!(chars[i + 1], 'x' | 'X' | 'b' | 'B')
+                {
+                    let radix = if matches!(chars[i + 1], 'x' | 'X') { 16 } else { 2 };
+                    i += 2;
+                    col += 2;
+                    let mut digits = String::new();
+                    while i < chars.len() && chars[i].is_ascii_hexdigit() {
+                        digits.push(chars[i]);
+                        i += 1;
+                        col += 1;
+                    }
+                    let value = i64::from_str_radix(&digits, radix).map_err(|_| {
+                        CompileError::new(
+                            Span::new(line, start_col),
+                            format!("invalid base-{} literal '{}'", radix, digits),
+                        )
+                    })?;
+                    tokens.push(Token {
+                        kind: TokenKind::IntLit(value),
+                        span: Span::new(line, start_col),
+                    });
+                    continue;
+                }
                 let mut num = String::new();
                 while i < chars.len() && chars[i].is_ascii_digit() {
                     num.push(chars[i]);
@@ -416,6 +442,20 @@ mod tests {
                 TokenKind::Star,
                 TokenKind::Slash,
                 TokenKind::Percent,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_hex_and_binary_literals() {
+        assert_eq!(
+            kinds("0xF 0x10 0xff 0b101"),
+            vec![
+                TokenKind::IntLit(15),
+                TokenKind::IntLit(16),
+                TokenKind::IntLit(255),
+                TokenKind::IntLit(5),
                 TokenKind::Eof,
             ]
         );
