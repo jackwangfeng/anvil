@@ -39,6 +39,51 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 i += 1;
                 col += 1;
             }
+            '=' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { kind: TokenKind::EqEq, span: Span::new(line, col) });
+                    i += 2;
+                    col += 2;
+                } else {
+                    tokens.push(Token { kind: TokenKind::Assign, span: Span::new(line, col) });
+                    i += 1;
+                    col += 1;
+                }
+            }
+            '<' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { kind: TokenKind::Le, span: Span::new(line, col) });
+                    i += 2;
+                    col += 2;
+                } else {
+                    tokens.push(Token { kind: TokenKind::Lt, span: Span::new(line, col) });
+                    i += 1;
+                    col += 1;
+                }
+            }
+            '>' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { kind: TokenKind::Ge, span: Span::new(line, col) });
+                    i += 2;
+                    col += 2;
+                } else {
+                    tokens.push(Token { kind: TokenKind::Gt, span: Span::new(line, col) });
+                    i += 1;
+                    col += 1;
+                }
+            }
+            '!' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { kind: TokenKind::NotEq, span: Span::new(line, col) });
+                    i += 2;
+                    col += 2;
+                } else {
+                    return Err(CompileError::new(
+                        Span::new(line, col),
+                        "unexpected character '!'".to_string(),
+                    ));
+                }
+            }
             c if c.is_ascii_digit() => {
                 let start_col = col;
                 let mut num = String::new();
@@ -69,6 +114,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 let kind = match ident.as_str() {
                     "int" => TokenKind::KwInt,
                     "return" => TokenKind::KwReturn,
+                    "if" => TokenKind::KwIf,
+                    "else" => TokenKind::KwElse,
+                    "while" => TokenKind::KwWhile,
+                    "for" => TokenKind::KwFor,
                     _ => TokenKind::Ident(ident),
                 };
                 tokens.push(Token { kind, span: Span::new(line, start_col) });
@@ -136,6 +185,27 @@ mod tests {
                 TokenKind::Star,
                 TokenKind::Slash,
                 TokenKind::Percent,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_m2_operators_and_keywords() {
+        assert_eq!(
+            kinds("= == != < <= > >= if else while for"),
+            vec![
+                TokenKind::Assign,
+                TokenKind::EqEq,
+                TokenKind::NotEq,
+                TokenKind::Lt,
+                TokenKind::Le,
+                TokenKind::Gt,
+                TokenKind::Ge,
+                TokenKind::KwIf,
+                TokenKind::KwElse,
+                TokenKind::KwWhile,
+                TokenKind::KwFor,
                 TokenKind::Eof,
             ]
         );
