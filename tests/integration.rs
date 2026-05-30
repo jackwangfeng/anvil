@@ -366,3 +366,34 @@ fn m7_fixed_arg_libc_still_works() {
         9
     );
 }
+
+#[test]
+fn m8_logical_short_circuit() {
+    assert_eq!(compile_and_run("int main(){ return (1 && 1) + (0 || 1); }", "m8_logic"), 2);
+}
+
+#[test]
+fn m8_bitwise() {
+    assert_eq!(
+        compile_and_run("int main(){ return (6 & 3) + (5 | 2) + (5 ^ 1) + (1 << 4) + (64 >> 2); }", "m8_bit"),
+        2 + 7 + 4 + 16 + 16
+    );
+}
+
+#[test]
+fn m8_not_and_bitnot() {
+    assert_eq!(compile_and_run("int main(){ return !0 + !5 + (~0 & 1); }", "m8_not"), 1 + 0 + 1);
+}
+
+#[test]
+fn m8_ternary() {
+    assert_eq!(compile_and_run("int main(){ int x=7; return x > 5 ? 100 : 200; }", "m8_tern"), 100);
+}
+
+#[test]
+fn m8_incdec_and_compound() {
+    assert_eq!(
+        compile_and_run("int main(){ int s=0; for(int i=0;i<5;i++){ s += i; } return s; }", "m8_incr"),
+        10
+    );
+}

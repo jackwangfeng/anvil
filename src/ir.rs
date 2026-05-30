@@ -1,4 +1,4 @@
-use crate::ast::{BinaryOp, Expr, FuncDef, Program as AstProgram, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, Expr, FuncDef, LogOp, Program as AstProgram, Stmt, UnaryOp};
 use crate::types::{Aggregates, Signatures, Type};
 use std::collections::HashMap;
 
@@ -38,6 +38,7 @@ pub enum Instr {
     LoadArg { dst: Temp, index: usize, width: usize },
     AddrOf { dst: Temp, off: usize },
     FieldAddr { dst: Temp, base: Temp, offset: usize },
+    Copy { dst: Temp, src: Temp, width: usize },
     LoadInd { dst: Temp, addr: Temp, width: usize, signed: bool },
     StoreInd { addr: Temp, src: Temp, width: usize },
     PtrAdd { dst: Temp, base: Temp, index: Temp, shift: u32 },
@@ -58,6 +59,11 @@ pub enum BinOp {
     Ge,
     Eq,
     Ne,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 pub fn lower(ast: &AstProgram) -> Program {
@@ -354,6 +360,58 @@ impl<'a> Lowerer<'a> {
                 }
             }
             Expr::Binary { op, lhs, rhs } => self.lower_binary(*op, lhs, rhs),
+            Expr::Logical { op, lhs, rhs } => {
+                let result = self.fresh();
+                match op {
+                    LogOp::And => {
+                        let lfalse = self.new_label();
+                        let lend = self.new_label();
+                        let (la, _) = self.lower_expr(lhs);
+                        self.body.push(Instr::JumpIfZero { cond: la, target: lfalse });
+                        let (lb, _) = self.lower_expr(rhs);
+                        self.body.push(Instr::JumpIfZero { cond: lb, target: lfalse });
+                        self.body.push(Instr::Const { dst: result, value: 1 });
+                        self.body.push(Instr::Jump(lend));
+                        self.body.push(Instr::Label(lfalse));
+                        self.body.push(Instr::Const { dst: result, value: 0 });
+                        self.body.push(Instr::Label(lend));
+                    }
+                    LogOp::Or => {
+                        let lcheck = self.new_label();
+                        let lfalse = self.new_label();
+                        let lend = self.new_label();
+                        let (la, _) = self.lower_expr(lhs);
+                        self.body.push(Instr::JumpIfZero { cond: la, target: lcheck });
+                        self.body.push(Instr::Const { dst: result, value: 1 });
+                        self.body.push(Instr::Jump(lend));
+                        self.body.push(Instr::Label(lcheck));
+                        let (lb, _) = self.lower_expr(rhs);
+                        self.body.push(Instr::JumpIfZero { cond: lb, target: lfalse });
+                        self.body.push(Instr::Const { dst: result, value: 1 });
+                        self.body.push(Instr::Jump(lend));
+                        self.body.push(Instr::Label(lfalse));
+                        self.body.push(Instr::Const { dst: result, value: 0 });
+                        self.body.push(Instr::Label(lend));
+                    }
+                }
+                (result, Type::Int)
+            }
+            Expr::Ternary { cond, then_e, else_e } => {
+                let lelse = self.new_label();
+                let lend = self.new_label();
+                let (c, _) = self.lower_expr(cond);
+                self.body.push(Instr::JumpIfZero { cond: c, target: lelse });
+                let (tv, tty) = self.lower_expr(then_e);
+                let width = self.size_of(&tty);
+                let result = self.fresh();
+                self.body.push(Instr::Copy { dst: result, src: tv, width });
+                self.body.push(Instr::Jump(lend));
+                self.body.push(Instr::Label(lelse));
+                let (ev, _) = self.lower_expr(else_e);
+                self.body.push(Instr::Copy { dst: result, src: ev, width });
+                self.body.push(Instr::Label(lend));
+                (result, tty)
+            }
             Expr::Assign { target, value } => {
                 let (v, vty) = self.lower_expr(value);
                 let (addr, ty) = self.lower_lvalue(target);
@@ -485,8 +543,10 @@ impl<'a> Lowerer<'a> {
             | Expr::Unary { .. }
             | Expr::Binary { .. }
             | Expr::Call { .. }
+            | Expr::Logical { .. }
             | Expr::SizeofType(_)
             | Expr::SizeofExpr(_) => Type::Int,
+            Expr::Ternary { then_e, .. } => self.type_of(then_e),
             Expr::StrLit(_) => Type::Pointer(Box::new(Type::Char)),
             Expr::Var(name) => self
                 .lookup_var(name)
@@ -562,6 +622,11 @@ fn lower_binop(op: BinaryOp) -> BinOp {
         BinaryOp::Ge => BinOp::Ge,
         BinaryOp::Eq => BinOp::Eq,
         BinaryOp::Ne => BinOp::Ne,
+        BinaryOp::BitAnd => BinOp::BitAnd,
+        BinaryOp::BitOr => BinOp::BitOr,
+        BinaryOp::BitXor => BinOp::BitXor,
+        BinaryOp::Shl => BinOp::Shl,
+        BinaryOp::Shr => BinOp::Shr,
     }
 }
 

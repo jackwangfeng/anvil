@@ -68,6 +68,16 @@ pub enum Expr {
         field: String,
         arrow: bool,
     },
+    Logical {
+        op: LogOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Ternary {
+        cond: Box<Expr>,
+        then_e: Box<Expr>,
+        else_e: Box<Expr>,
+    },
     SizeofType(Type),
     SizeofExpr(Box<Expr>),
     Unary {
@@ -100,4 +110,15 @@ pub enum BinaryOp {
     Ge,
     Eq,
     Ne,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogOp {
+    And,
+    Or,
 }
