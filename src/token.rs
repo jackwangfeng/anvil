@@ -18,6 +18,9 @@ pub enum TokenKind {
     Slash,
     Percent,
     Comma,
+    Amp,
+    LBracket,
+    RBracket,
     Assign,
     Lt,
     Gt,
@@ -29,6 +32,8 @@ pub enum TokenKind {
     KwElse,
     KwWhile,
     KwFor,
+    KwChar,
+    KwSizeof,
     Eof,
 }
 

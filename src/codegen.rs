@@ -11,18 +11,18 @@ pub fn generate(program: &Program) -> String {
     out
 }
 
-/// 槽位 i：相对 sp 偏移 i*8 字节（8 字节以容纳指针）。
+/// 槽位即帧内字节偏移。
 fn slot(t: usize) -> usize {
-    t * 8
+    t
 }
 
-/// 栈帧大小：num_slots*8 向上对齐到 16。
-fn frame_size(num_temps: usize) -> usize {
-    (num_temps * 8).div_ceil(16) * 16
+/// 栈帧大小：frame_bytes 向上对齐到 16。
+fn frame_size(frame_bytes: usize) -> usize {
+    frame_bytes.div_ceil(16) * 16
 }
 
 fn gen_func(func: &Function, out: &mut String) {
-    let frame = frame_size(func.num_temps);
+    let frame = frame_size(func.frame_bytes);
     let _ = writeln!(out, ".globl _{}", func.name);
     out.push_str(".p2align 2\n");
     let _ = writeln!(out, "_{}:", func.name);
@@ -62,18 +62,6 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             out.push_str("    neg w9, w9\n");
             let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
         }
-        Instr::Load { dst, var } => {
-            let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*var));
-            let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
-        }
-        Instr::Store { var, src } => {
-            let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*src));
-            let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*var));
-        }
-        Instr::Copy { dst, src } => {
-            let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*src));
-            let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
-        }
         Instr::Label(n) => {
             let _ = writeln!(out, "L{}_{}:", func, n);
         }
@@ -84,12 +72,63 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*cond));
             let _ = writeln!(out, "    cbz w9, L{}_{}", func, target);
         }
-        Instr::LoadArg { dst, index } => {
-            let _ = writeln!(out, "    str w{}, [sp, #{}]", index, slot(*dst));
-        }
+        Instr::LoadArg { dst, index, width } => match *width {
+            8 => {
+                let _ = writeln!(out, "    str x{}, [sp, #{}]", index, slot(*dst));
+            }
+            1 => {
+                let _ = writeln!(out, "    strb w{}, [sp, #{}]", index, slot(*dst));
+            }
+            _ => {
+                let _ = writeln!(out, "    str w{}, [sp, #{}]", index, slot(*dst));
+            }
+        },
         Instr::StrLit { dst, index } => {
             let _ = writeln!(out, "    adrp x9, L_.str.{}@PAGE", index);
             let _ = writeln!(out, "    add x9, x9, L_.str.{}@PAGEOFF", index);
+            let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
+        Instr::AddrOf { dst, off } => {
+            let _ = writeln!(out, "    add x9, sp, #{}", off);
+            let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
+        Instr::LoadInd { dst, addr, width, signed } => {
+            let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*addr));
+            match (*width, *signed) {
+                (1, true) => out.push_str("    ldrsb w10, [x9]\n"),
+                (1, false) => out.push_str("    ldrb w10, [x9]\n"),
+                (8, _) => out.push_str("    ldr x10, [x9]\n"),
+                _ => out.push_str("    ldr w10, [x9]\n"),
+            }
+            if *width == 8 {
+                let _ = writeln!(out, "    str x10, [sp, #{}]", slot(*dst));
+            } else {
+                let _ = writeln!(out, "    str w10, [sp, #{}]", slot(*dst));
+            }
+        }
+        Instr::StoreInd { addr, src, width } => {
+            let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*addr));
+            if *width == 8 {
+                let _ = writeln!(out, "    ldr x10, [sp, #{}]", slot(*src));
+                out.push_str("    str x10, [x9]\n");
+            } else {
+                let _ = writeln!(out, "    ldr w10, [sp, #{}]", slot(*src));
+                match *width {
+                    1 => out.push_str("    strb w10, [x9]\n"),
+                    _ => out.push_str("    str w10, [x9]\n"),
+                }
+            }
+        }
+        Instr::PtrAdd { dst, base, index, shift } => {
+            let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*base));
+            let _ = writeln!(out, "    ldr w10, [sp, #{}]", slot(*index));
+            let _ = writeln!(out, "    add x9, x9, w10, sxtw #{}", shift);
+            let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
+        Instr::PtrSub { dst, base, index, shift } => {
+            let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*base));
+            let _ = writeln!(out, "    ldr w10, [sp, #{}]", slot(*index));
+            let _ = writeln!(out, "    sub x9, x9, w10, sxtw #{}", shift);
             let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
         }
         Instr::Call { dst, name, args } => {
@@ -108,7 +147,6 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
                 BinOp::Mul => out.push_str("    mul w9, w9, w10\n"),
                 BinOp::Div => out.push_str("    sdiv w9, w9, w10\n"),
                 BinOp::Mod => {
-                    // w9 % w10 = w9 - (w9 / w10) * w10
                     out.push_str("    sdiv w11, w9, w10\n");
                     out.push_str("    msub w9, w11, w10, w9\n");
                 }
@@ -148,12 +186,12 @@ mod tests {
     use super::*;
     use crate::ir::{BinOp, Function, Instr, Program};
 
-    fn gen(func_body: Vec<Instr>, num_temps: usize) -> String {
+    fn gen(func_body: Vec<Instr>, frame_bytes: usize) -> String {
         generate(&Program {
             functions: vec![Function {
                 name: "main".to_string(),
                 body: func_body,
-                num_temps,
+                frame_bytes,
             }],
             strings: vec![],
         })
@@ -163,11 +201,11 @@ mod tests {
     fn codegen_const_return() {
         let asm = gen(
             vec![Instr::Const { dst: 0, value: 42 }, Instr::Return { src: 0 }],
-            1,
+            8,
         );
         assert!(asm.contains(".globl _main"));
         assert!(asm.contains("_main:"));
-        assert!(asm.contains("movz w9, #42")); // 物化常量 42
+        assert!(asm.contains("movz w9, #42"));
         assert!(asm.contains("ret"));
     }
 
@@ -176,14 +214,13 @@ mod tests {
         let asm = gen(
             vec![
                 Instr::Const { dst: 0, value: 1 },
-                Instr::Const { dst: 1, value: 2 },
-                Instr::Bin { dst: 2, op: BinOp::Add, lhs: 0, rhs: 1 },
-                Instr::Return { src: 2 },
+                Instr::Const { dst: 8, value: 2 },
+                Instr::Bin { dst: 16, op: BinOp::Add, lhs: 0, rhs: 8 },
+                Instr::Return { src: 16 },
             ],
-            3,
+            24,
         );
         assert!(asm.contains("add w9, w9, w10"));
-        // 栈帧：3 个槽 *8 = 24，向上对齐到 32
         assert!(asm.contains("sub sp, sp, #32"));
         assert!(asm.contains("add sp, sp, #32"));
     }
@@ -193,11 +230,11 @@ mod tests {
         let asm = gen(
             vec![
                 Instr::Const { dst: 0, value: 17 },
-                Instr::Const { dst: 1, value: 5 },
-                Instr::Bin { dst: 2, op: BinOp::Mod, lhs: 0, rhs: 1 },
-                Instr::Return { src: 2 },
+                Instr::Const { dst: 8, value: 5 },
+                Instr::Bin { dst: 16, op: BinOp::Mod, lhs: 0, rhs: 8 },
+                Instr::Return { src: 16 },
             ],
-            3,
+            24,
         );
         assert!(asm.contains("sdiv w11, w9, w10"));
         assert!(asm.contains("msub w9, w11, w10, w9"));
@@ -208,11 +245,11 @@ mod tests {
         let asm = gen(
             vec![
                 Instr::Const { dst: 0, value: 1 },
-                Instr::Const { dst: 1, value: 2 },
-                Instr::Bin { dst: 2, op: BinOp::Lt, lhs: 0, rhs: 1 },
-                Instr::Return { src: 2 },
+                Instr::Const { dst: 8, value: 2 },
+                Instr::Bin { dst: 16, op: BinOp::Lt, lhs: 0, rhs: 8 },
+                Instr::Return { src: 16 },
             ],
-            3,
+            24,
         );
         assert!(asm.contains("cmp w9, w10"));
         assert!(asm.contains("cset w9, lt"));
@@ -227,10 +264,10 @@ mod tests {
                 Instr::JumpIfZero { cond: 0, target: 1 },
                 Instr::Jump(0),
                 Instr::Label(1),
-                Instr::Const { dst: 1, value: 7 },
-                Instr::Return { src: 1 },
+                Instr::Const { dst: 8, value: 7 },
+                Instr::Return { src: 8 },
             ],
-            2,
+            16,
         );
         assert!(asm.contains("Lmain_0:"));
         assert!(asm.contains("Lmain_1:"));
@@ -239,25 +276,10 @@ mod tests {
     }
 
     #[test]
-    fn codegen_load_store_roundtrip() {
-        let asm = gen(
-            vec![
-                Instr::Const { dst: 1, value: 9 },
-                Instr::Store { var: 0, src: 1 },
-                Instr::Load { dst: 2, var: 0 },
-                Instr::Return { src: 2 },
-            ],
-            3,
-        );
-        assert!(asm.contains("str w9, [sp, #0]"));
-        assert!(asm.contains("ldr w9, [sp, #0]"));
-    }
-
-    #[test]
     fn codegen_prologue_saves_fp_lr() {
         let asm = gen(
             vec![Instr::Const { dst: 0, value: 1 }, Instr::Return { src: 0 }],
-            1,
+            8,
         );
         assert!(asm.contains("stp x29, x30, [sp, #-16]!"));
         assert!(asm.contains("ldp x29, x30, [sp], #16"));
@@ -269,16 +291,16 @@ mod tests {
             functions: vec![Function {
                 name: "main".to_string(),
                 body: vec![
-                    Instr::LoadArg { dst: 0, index: 0 },
-                    Instr::Call { dst: 1, name: "puts".to_string(), args: vec![0] },
-                    Instr::Return { src: 1 },
+                    Instr::LoadArg { dst: 0, index: 0, width: 4 },
+                    Instr::Call { dst: 8, name: "puts".to_string(), args: vec![0] },
+                    Instr::Return { src: 8 },
                 ],
-                num_temps: 2,
+                frame_bytes: 16,
             }],
             strings: vec![],
         });
-        assert!(asm.contains("str w0, [sp, #0]")); // LoadArg index0 -> slot0
-        assert!(asm.contains("ldr x0, [sp, #0]")); // call arg0 from slot0
+        assert!(asm.contains("str w0, [sp, #0]"));
+        assert!(asm.contains("ldr x0, [sp, #0]"));
         assert!(asm.contains("bl _puts"));
     }
 
@@ -291,7 +313,7 @@ mod tests {
                     Instr::StrLit { dst: 0, index: 0 },
                     Instr::Return { src: 0 },
                 ],
-                num_temps: 1,
+                frame_bytes: 8,
             }],
             strings: vec!["Hi".to_string()],
         });
@@ -299,7 +321,7 @@ mod tests {
         assert!(asm.contains("add x9, x9, L_.str.0@PAGEOFF"));
         assert!(asm.contains("__cstring"));
         assert!(asm.contains("L_.str.0:"));
-        assert!(asm.contains(".byte 72, 105, 0")); // 'H','i',0
+        assert!(asm.contains(".byte 72, 105, 0"));
     }
 
     #[test]
@@ -313,11 +335,61 @@ mod tests {
                     Instr::Const { dst: 0, value: 0 },
                     Instr::Return { src: 0 },
                 ],
-                num_temps: 1,
+                frame_bytes: 8,
             }],
             strings: vec![],
         });
         assert!(asm.contains("Lmain_0:"));
         assert!(asm.contains("b Lmain_0"));
+    }
+
+    #[test]
+    fn codegen_addr_of() {
+        let asm = generate(&Program {
+            functions: vec![Function {
+                name: "main".to_string(),
+                body: vec![Instr::AddrOf { dst: 8, off: 0 }, Instr::Return { src: 8 }],
+                frame_bytes: 16,
+            }],
+            strings: vec![],
+        });
+        assert!(asm.contains("add x9, sp, #0"));
+        assert!(asm.contains("str x9, [sp, #8]"));
+    }
+
+    #[test]
+    fn codegen_load_store_ind_widths() {
+        let asm = generate(&Program {
+            functions: vec![Function {
+                name: "main".to_string(),
+                body: vec![
+                    Instr::LoadInd { dst: 8, addr: 0, width: 4, signed: false },
+                    Instr::LoadInd { dst: 16, addr: 0, width: 1, signed: true },
+                    Instr::StoreInd { addr: 0, src: 8, width: 8 },
+                    Instr::Return { src: 8 },
+                ],
+                frame_bytes: 24,
+            }],
+            strings: vec![],
+        });
+        assert!(asm.contains("ldr w10, [x9]"));
+        assert!(asm.contains("ldrsb w10, [x9]"));
+        assert!(asm.contains("str x10, [x9]"));
+    }
+
+    #[test]
+    fn codegen_ptradd_scales() {
+        let asm = generate(&Program {
+            functions: vec![Function {
+                name: "main".to_string(),
+                body: vec![
+                    Instr::PtrAdd { dst: 16, base: 0, index: 8, shift: 2 },
+                    Instr::Return { src: 16 },
+                ],
+                frame_bytes: 24,
+            }],
+            strings: vec![],
+        });
+        assert!(asm.contains("add x9, x9, w10, sxtw #2"));
     }
 }

@@ -1,6 +1,7 @@
 use crate::ast::{BinaryOp, Expr, FuncDef, Program, Stmt, UnaryOp};
 use crate::error::CompileError;
 use crate::token::{Token, TokenKind};
+use crate::types::Type;
 
 pub fn parse(tokens: &[Token]) -> Result<Program, CompileError> {
     let mut p = Parser { tokens, pos: 0 };
@@ -52,15 +53,37 @@ impl<'a> Parser<'a> {
         Ok(Program { functions })
     }
 
+    /// 解析基础类型 + 零个或多个 `*`。返回 None 表示当前不是类型起始。
+    fn try_parse_base_type(&mut self) -> Option<Type> {
+        let base = match self.peek_kind() {
+            TokenKind::KwInt => Type::Int,
+            TokenKind::KwChar => Type::Char,
+            _ => return None,
+        };
+        self.pos += 1;
+        let mut ty = base;
+        while *self.peek_kind() == TokenKind::Star {
+            self.pos += 1;
+            ty = Type::Pointer(Box::new(ty));
+        }
+        Some(ty)
+    }
+
     fn parse_func_def(&mut self) -> Result<FuncDef, CompileError> {
-        self.expect(&TokenKind::KwInt)?;
+        self.expect(&TokenKind::KwInt)?; // 返回类型当前固定 int
         let name = self.expect_ident()?;
         self.expect(&TokenKind::LParen)?;
         let mut params = Vec::new();
         if *self.peek_kind() != TokenKind::RParen {
             loop {
-                self.expect(&TokenKind::KwInt)?;
-                params.push(self.expect_ident()?);
+                let ty = self.try_parse_base_type().ok_or_else(|| {
+                    CompileError::new(
+                        self.tokens[self.pos].span,
+                        "expected parameter type".to_string(),
+                    )
+                })?;
+                let pname = self.expect_ident()?;
+                params.push((pname, ty));
                 if *self.peek_kind() == TokenKind::Comma {
                     self.pos += 1;
                 } else {
@@ -81,7 +104,7 @@ impl<'a> Parser<'a> {
     fn parse_stmt(&mut self) -> Result<Stmt, CompileError> {
         match self.peek_kind() {
             TokenKind::KwReturn => self.parse_return(),
-            TokenKind::KwInt => self.parse_declaration(),
+            TokenKind::KwInt | TokenKind::KwChar => self.parse_declaration(),
             TokenKind::KwIf => self.parse_if(),
             TokenKind::KwWhile => self.parse_while(),
             TokenKind::KwFor => self.parse_for(),
@@ -106,8 +129,26 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_declaration(&mut self) -> Result<Stmt, CompileError> {
-        self.expect(&TokenKind::KwInt)?;
+        let mut ty = self
+            .try_parse_base_type()
+            .expect("parse_declaration called without a type");
         let name = self.expect_ident()?;
+        // 数组后缀 name[N]
+        if *self.peek_kind() == TokenKind::LBracket {
+            self.pos += 1;
+            let n = match self.peek_kind() {
+                TokenKind::IntLit(v) => *v as usize,
+                _ => {
+                    return Err(CompileError::new(
+                        self.tokens[self.pos].span,
+                        "expected array size".to_string(),
+                    ))
+                }
+            };
+            self.pos += 1;
+            self.expect(&TokenKind::RBracket)?;
+            ty = Type::Array(Box::new(ty), n);
+        }
         let init = if *self.peek_kind() == TokenKind::Assign {
             self.pos += 1;
             Some(self.parse_expr()?)
@@ -115,7 +156,7 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect(&TokenKind::Semicolon)?;
-        Ok(Stmt::Declare { name, init })
+        Ok(Stmt::Declare { name, ty, init })
     }
 
     fn parse_block(&mut self) -> Result<Stmt, CompileError> {
@@ -162,7 +203,7 @@ impl<'a> Parser<'a> {
         let init = if *self.peek_kind() == TokenKind::Semicolon {
             self.pos += 1;
             None
-        } else if *self.peek_kind() == TokenKind::KwInt {
+        } else if matches!(self.peek_kind(), TokenKind::KwInt | TokenKind::KwChar) {
             Some(Box::new(self.parse_declaration()?)) // 自带分号消费
         } else {
             let e = self.parse_expr()?;
@@ -199,16 +240,15 @@ impl<'a> Parser<'a> {
         if *self.peek_kind() == TokenKind::Assign {
             self.pos += 1;
             let value = self.parse_assign()?; // 右结合
-            if let Expr::Var(name) = lhs {
-                Ok(Expr::Assign {
-                    name,
+            match &lhs {
+                Expr::Var(_) | Expr::Deref(_) | Expr::Index { .. } => Ok(Expr::Assign {
+                    target: Box::new(lhs),
                     value: Box::new(value),
-                })
-            } else {
-                Err(CompileError::new(
+                }),
+                _ => Err(CompileError::new(
                     self.tokens[self.pos.saturating_sub(1)].span,
                     "invalid assignment target".to_string(),
-                ))
+                )),
             }
         } else {
             Ok(lhs)
@@ -249,8 +289,43 @@ impl<'a> Parser<'a> {
                     operand: Box::new(self.parse_unary()?),
                 })
             }
-            _ => self.parse_primary(),
+            TokenKind::Amp => {
+                self.pos += 1;
+                Ok(Expr::Addr(Box::new(self.parse_unary()?)))
+            }
+            TokenKind::Star => {
+                self.pos += 1;
+                Ok(Expr::Deref(Box::new(self.parse_unary()?)))
+            }
+            TokenKind::KwSizeof => {
+                self.pos += 1;
+                self.expect(&TokenKind::LParen)?;
+                if let Some(ty) = self.try_parse_base_type() {
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(Expr::SizeofType(ty))
+                } else {
+                    let e = self.parse_expr()?;
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(Expr::SizeofExpr(Box::new(e)))
+                }
+            }
+            _ => self.parse_postfix(),
         }
+    }
+
+    /// primary 后跟零个或多个下标 `[expr]`。
+    fn parse_postfix(&mut self) -> Result<Expr, CompileError> {
+        let mut e = self.parse_primary()?;
+        while *self.peek_kind() == TokenKind::LBracket {
+            self.pos += 1;
+            let index = self.parse_expr()?;
+            self.expect(&TokenKind::RBracket)?;
+            e = Expr::Index {
+                base: Box::new(e),
+                index: Box::new(index),
+            };
+        }
+        Ok(e)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, CompileError> {
@@ -324,6 +399,7 @@ mod tests {
     use super::*;
     use crate::ast::{BinaryOp, Expr, Stmt, UnaryOp};
     use crate::lexer::lex;
+    use crate::types::Type;
 
     fn parse_return_expr(src: &str) -> Expr {
         let prog = parse(&lex(src).unwrap()).unwrap();
@@ -348,7 +424,74 @@ mod tests {
         let prog = parse(&lex("int add(int a, int b){ return a+b; }").unwrap()).unwrap();
         let f = &prog.functions[0];
         assert_eq!(f.name, "add");
-        assert_eq!(f.params, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            f.params,
+            vec![("a".to_string(), Type::Int), ("b".to_string(), Type::Int)]
+        );
+    }
+
+    #[test]
+    fn parse_pointer_decl() {
+        let body = parse_body("int main(){ int* p; return 0; }");
+        match &body[0] {
+            Stmt::Declare { name, ty, .. } => {
+                assert_eq!(name, "p");
+                assert_eq!(*ty, Type::Pointer(Box::new(Type::Int)));
+            }
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_array_decl() {
+        let body = parse_body("int main(){ int a[10]; return 0; }");
+        match &body[0] {
+            Stmt::Declare { ty, .. } => assert_eq!(*ty, Type::Array(Box::new(Type::Int), 10)),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_addr_deref_index() {
+        assert_eq!(
+            parse_return_expr("int main(){ return *p; }"),
+            Expr::Deref(Box::new(Expr::Var("p".to_string())))
+        );
+        assert_eq!(
+            parse_return_expr("int main(){ return &x; }"),
+            Expr::Addr(Box::new(Expr::Var("x".to_string())))
+        );
+        assert_eq!(
+            parse_return_expr("int main(){ return a[2]; }"),
+            Expr::Index {
+                base: Box::new(Expr::Var("a".to_string())),
+                index: Box::new(Expr::IntLit(2)),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_sizeof() {
+        assert_eq!(
+            parse_return_expr("int main(){ return sizeof(int); }"),
+            Expr::SizeofType(Type::Int)
+        );
+        assert_eq!(
+            parse_return_expr("int main(){ return sizeof(x); }"),
+            Expr::SizeofExpr(Box::new(Expr::Var("x".to_string())))
+        );
+    }
+
+    #[test]
+    fn parse_typed_params() {
+        let prog = parse(&lex("int f(int* p, char c){ return 0; }").unwrap()).unwrap();
+        assert_eq!(
+            prog.functions[0].params,
+            vec![
+                ("p".to_string(), Type::Pointer(Box::new(Type::Int))),
+                ("c".to_string(), Type::Char),
+            ]
+        );
     }
 
     #[test]
@@ -382,6 +525,7 @@ mod tests {
             body[0],
             Stmt::Declare {
                 name: "x".to_string(),
+                ty: Type::Int,
                 init: Some(Expr::IntLit(5))
             }
         );
@@ -395,13 +539,14 @@ mod tests {
             body[0],
             Stmt::Declare {
                 name: "x".to_string(),
+                ty: Type::Int,
                 init: None
             }
         );
         assert_eq!(
             body[1],
             Stmt::ExprStmt(Expr::Assign {
-                name: "x".to_string(),
+                target: Box::new(Expr::Var("x".to_string())),
                 value: Box::new(Expr::IntLit(3)),
             })
         );

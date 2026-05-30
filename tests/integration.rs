@@ -177,3 +177,52 @@ fn m3_hello_world() {
     assert_eq!(code, 0);
     assert_eq!(stdout, "Hello, World!\n"); // puts 追加换行
 }
+
+#[test]
+fn m4_pointer_store() {
+    assert_eq!(
+        compile_and_run("int main(){ int x=5; int* p=&x; *p=9; return x; }", "m4_ptr"),
+        9
+    );
+}
+
+#[test]
+fn m4_array_sum() {
+    assert_eq!(
+        compile_and_run(
+            "int main(){ int a[3]; a[0]=10; a[1]=20; a[2]=12; int s=0; for(int i=0;i<3;i=i+1) s=s+a[i]; return s; }",
+            "m4_arr"
+        ),
+        42
+    );
+}
+
+#[test]
+fn m4_sizeof() {
+    assert_eq!(
+        compile_and_run("int main(){ return sizeof(int)+sizeof(char)+sizeof(int*); }", "m4_sizeof"),
+        13
+    );
+}
+
+#[test]
+fn m4_strlen_via_pointer() {
+    assert_eq!(
+        compile_and_run(
+            "int main(){ char* s=\"abcd\"; int n=0; while(*s != 0){ n=n+1; s=s+1; } return n; }",
+            "m4_strlen"
+        ),
+        4
+    );
+}
+
+#[test]
+fn m4_pointer_param() {
+    assert_eq!(
+        compile_and_run(
+            "int set9(int* p){ *p = 9; return 0; } int main(){ int x = 1; set9(&x); return x; }",
+            "m4_ptr_param"
+        ),
+        9
+    );
+}

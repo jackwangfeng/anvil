@@ -1,3 +1,5 @@
+use crate::types::Type;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub functions: Vec<FuncDef>,
@@ -6,16 +8,17 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncDef {
     pub name: String,
-    pub params: Vec<String>,
+    pub params: Vec<(String, Type)>,
     pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
     Return(Expr),
-    /// int <name>;  或  int <name> = <init>;
+    /// <type> <name>;  或  <type> <name> = <init>;  或  <type> <name>[N];
     Declare {
         name: String,
+        ty: Type,
         init: Option<Expr>,
     },
     ExprStmt(Expr),
@@ -48,9 +51,17 @@ pub enum Expr {
         args: Vec<Expr>,
     },
     Assign {
-        name: String,
+        target: Box<Expr>,
         value: Box<Expr>,
     },
+    Addr(Box<Expr>),
+    Deref(Box<Expr>),
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
+    SizeofType(Type),
+    SizeofExpr(Box<Expr>),
     Unary {
         op: UnaryOp,
         operand: Box<Expr>,
