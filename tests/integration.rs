@@ -531,3 +531,85 @@ fn m11_double_return() {
     assert_eq!(code, 1);
     assert_eq!(out, "4.500000\n");
 }
+
+// ---- M12: double 参数 + 结构体按值传参/返回（System V ABI）----
+
+#[test]
+fn m12_double_params_add() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\ndouble add(double a, double b){ return a + b; }\nint main(){ printf(\"%f\\n\", add(1.5, 2.25)); return 0; }",
+        "m12_dadd",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "3.750000\n");
+}
+
+#[test]
+fn m12_double_params_mixed_int_double() {
+    // 整型与浮点形参各走独立寄存器组；int 实参隐式转 double
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\ndouble f(int n, double x){ return n * x; }\nint main(){ printf(\"%f\\n\", f(3, 1.5)); return 0; }",
+        "m12_dmix",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "4.500000\n");
+}
+
+#[test]
+fn m12_int_arg_coerced_to_double_param() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\ndouble half(double x){ return x / 2; }\nint main(){ printf(\"%f\\n\", half(9)); return 0; }",
+        "m12_coerce",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "4.500000\n");
+}
+
+#[test]
+fn m12_many_double_params() {
+    // 9 个 double：前 8 个进 xmm0-7，第 9 个溢出到栈
+    let src = "double s(double a,double b,double c,double d,double e,double f,double g,double h,double i){ return a+b+c+d+e+f+g+h+i; }\nint main(){ int r = s(1,2,3,4,5,6,7,8,9); return r; }";
+    assert_eq!(compile_and_run(src, "m12_many_d"), 45);
+}
+
+#[test]
+fn m12_struct_byval_arg_small() {
+    // ≤16 字节结构体经整型寄存器传参
+    let src = "struct P { int x; int y; }; int sum(struct P p){ return p.x + p.y; }\nint main(){ struct P q; q.x = 10; q.y = 20; return sum(q); }";
+    assert_eq!(compile_and_run(src, "m12_s_small"), 30);
+}
+
+#[test]
+fn m12_struct_return_small() {
+    // ≤16 字节结构体经 rax:rdx 返回
+    let src = "struct P { int x; int y; }; struct P make(int a, int b){ struct P p; p.x = a; p.y = b; return p; }\nint main(){ struct P q = make(7, 8); return q.x + q.y; }";
+    assert_eq!(compile_and_run(src, "m12_s_ret"), 15);
+}
+
+#[test]
+fn m12_struct_byval_arg_large() {
+    // >16 字节结构体经栈传参
+    let src = "struct Big { int a; int b; int c; int d; int e; }; int sum(struct Big b){ return b.a+b.b+b.c+b.d+b.e; }\nint main(){ struct Big g; g.a=1; g.b=2; g.c=3; g.d=4; g.e=5; return sum(g); }";
+    assert_eq!(compile_and_run(src, "m12_s_big"), 15);
+}
+
+#[test]
+fn m12_struct_return_large_sret() {
+    // >16 字节结构体经隐式指针(sret)返回
+    let src = "struct Big { int a; int b; int c; int d; int e; }; struct Big mk(int base){ struct Big b; b.a=base; b.b=base+1; b.c=base+2; b.d=base+3; b.e=base+4; return b; }\nint main(){ struct Big g = mk(100); return g.a + g.e; }";
+    assert_eq!(compile_and_run(src, "m12_s_bigret"), 204);
+}
+
+#[test]
+fn m12_struct_byval_semantics() {
+    // 按值传参：被调方修改不影响调用方副本（返回调用方的 r.x，应仍为 5）
+    let src = "struct P { int x; int y; }; int mutate(struct P p){ p.x = 999; return p.x; }\nint main(){ struct P r; r.x = 5; r.y = 6; mutate(r); return r.x; }";
+    assert_eq!(compile_and_run(src, "m12_s_sem"), 5);
+}
+
+#[test]
+fn m12_struct_roundtrip() {
+    // 返回的结构体直接作为另一个函数的按值实参
+    let src = "struct P { int x; int y; }; struct P make(int a,int b){ struct P p; p.x=a; p.y=b; return p; } int sum(struct P p){ return p.x+p.y; }\nint main(){ return sum(make(40, 2)); }";
+    assert_eq!(compile_and_run(src, "m12_s_rt"), 42);
+}

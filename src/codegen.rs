@@ -77,8 +77,113 @@ fn gen_func(func: &Function, out: &mut String) {
     if frame > 0 {
         let _ = writeln!(out, "    sub sp, sp, #{}", frame);
     }
+    // 大结构体返回：隐式返回指针在 x8，存到 sret 槽供 Return 回写。
+    if let Some(s) = func.sret_slot {
+        let _ = writeln!(out, "    str x8, [sp, #{}]", slot(s));
+    }
+    gen_params(&func.params, out);
     for instr in &func.body {
-        gen_instr(instr, &func.name, frame, out);
+        gen_instr(instr, &func.name, frame, func.sret_slot, out);
+    }
+}
+
+/// 一个实参/形参在 AAPCS64 下的去向。
+enum Cls {
+    /// 标量整型/指针 → 第 n 个整型寄存器 x{n}。
+    Int(usize),
+    /// 标量 double → 第 n 个 FP 寄存器 d{n}。
+    Fp(usize),
+    /// 按值结构体（≤16B）→ 连续整型寄存器。
+    IntRegs(Vec<usize>),
+    /// 压栈：位于栈实参区偏移 `off`，占 `dwords` 个 8 字节。
+    Stack { off: usize, dwords: usize },
+}
+
+/// AAPCS64 实参分类：整型组 x0..x7（8），FP 组 d0..d7（8），各自独立计数；
+/// 溢出按 8 字节为单位压栈。Apple 约定：可变参数（index ≥ fixed）一律压栈。
+/// 大结构体返回经 x8（独立于 x0-x7，不占整型参数槽），故此处无需 sret 偏移。
+/// 返回 (各项去向, 栈实参区总字节数)。
+fn classify_aapcs64(
+    items: &[(bool, Option<usize>)],
+    variadic: bool,
+    fixed: usize,
+) -> (Vec<Cls>, usize) {
+    let mut ngrn = 0;
+    let mut nsrn = 0;
+    let mut soff = 0;
+    let classes = items
+        .iter()
+        .enumerate()
+        .map(|(i, &(is_float, agg))| {
+            let force_stack = variadic && i >= fixed;
+            if let Some(sz) = agg {
+                let ndw = sz.div_ceil(8);
+                if !force_stack && sz <= 16 && ngrn + ndw <= 8 {
+                    let regs = (ngrn..ngrn + ndw).collect();
+                    ngrn += ndw;
+                    Cls::IntRegs(regs)
+                } else {
+                    let off = soff;
+                    soff += ndw * 8;
+                    Cls::Stack { off, dwords: ndw }
+                }
+            } else if is_float && !force_stack {
+                if nsrn < 8 {
+                    nsrn += 1;
+                    Cls::Fp(nsrn - 1)
+                } else {
+                    let off = soff;
+                    soff += 8;
+                    Cls::Stack { off, dwords: 1 }
+                }
+            } else if !force_stack && ngrn < 8 {
+                ngrn += 1;
+                Cls::Int(ngrn - 1)
+            } else {
+                let off = soff;
+                soff += 8;
+                Cls::Stack { off, dwords: 1 }
+            }
+        })
+        .collect();
+    (classes, soff)
+}
+
+/// 把入参从寄存器/栈落到各自帧槽位（AAPCS64）。
+fn gen_params(params: &[crate::ir::Param], out: &mut String) {
+    let items: Vec<(bool, Option<usize>)> = params
+        .iter()
+        .map(|p| (p.is_float, if p.is_aggregate { Some(p.size) } else { None }))
+        .collect();
+    let (classes, _) = classify_aapcs64(&items, false, params.len());
+    for (p, c) in params.iter().zip(classes.iter()) {
+        match c {
+            Cls::Int(r) => match p.size {
+                8 => {
+                    let _ = writeln!(out, "    str x{}, [sp, #{}]", r, slot(p.slot));
+                }
+                1 => {
+                    let _ = writeln!(out, "    strb w{}, [sp, #{}]", r, slot(p.slot));
+                }
+                _ => {
+                    let _ = writeln!(out, "    str w{}, [sp, #{}]", r, slot(p.slot));
+                }
+            },
+            Cls::Fp(r) => {
+                let _ = writeln!(out, "    str d{}, [sp, #{}]", r, slot(p.slot));
+            }
+            Cls::IntRegs(regs) => {
+                for (k, r) in regs.iter().enumerate() {
+                    let _ = writeln!(out, "    str x{}, [sp, #{}]", r, slot(p.slot + k * 8));
+                }
+            }
+            Cls::Stack { off, dwords } => {
+                for k in 0..*dwords {
+                    let _ = writeln!(out, "    ldr x9, [x29, #{}]", 16 + off + k * 8);
+                    let _ = writeln!(out, "    str x9, [sp, #{}]", slot(p.slot + k * 8));
+                }
+            }
+        }
     }
 }
 
@@ -97,7 +202,7 @@ fn gen_strings(strings: &[String], out: &mut String) {
     }
 }
 
-fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
+fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, out: &mut String) {
     match instr {
         Instr::Const { dst, value } => {
             materialize_const(*value, out);
@@ -117,30 +222,6 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
         Instr::JumpIfZero { cond, target } => {
             let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*cond));
             let _ = writeln!(out, "    cbz w9, L{}_{}", func, target);
-        }
-        Instr::LoadArg { dst, index, width } => {
-            if *index < 8 {
-                match *width {
-                    8 => {
-                        let _ = writeln!(out, "    str x{}, [sp, #{}]", index, slot(*dst));
-                    }
-                    1 => {
-                        let _ = writeln!(out, "    strb w{}, [sp, #{}]", index, slot(*dst));
-                    }
-                    _ => {
-                        let _ = writeln!(out, "    str w{}, [sp, #{}]", index, slot(*dst));
-                    }
-                }
-            } else {
-                // 第 9+ 个参数：调用方放在栈上，位于 [x29 + 16 + (index-8)*8]
-                let off = 16 + (index - 8) * 8;
-                let _ = writeln!(out, "    ldr x9, [x29, #{}]", off);
-                if *width == 8 {
-                    let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
-                } else {
-                    let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
-                }
-            }
         }
         Instr::StrLit { dst, index } => {
             let _ = writeln!(out, "    adrp x9, L_.str.{}@PAGE", index);
@@ -168,6 +249,15 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             } else {
                 let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*src));
                 let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
+            }
+        }
+        Instr::MemCpy { dst, src, size } => {
+            // dst/src 存放目标/源地址，逐 8 字节拷贝（向上取整）。
+            let _ = writeln!(out, "    ldr x11, [sp, #{}]", slot(*dst));
+            let _ = writeln!(out, "    ldr x10, [sp, #{}]", slot(*src));
+            for k in 0..size.div_ceil(8) {
+                let _ = writeln!(out, "    ldr x9, [x10, #{}]", k * 8);
+                let _ = writeln!(out, "    str x9, [x11, #{}]", k * 8);
             }
         }
         Instr::LoadInd { dst, addr, width, signed } => {
@@ -209,33 +299,99 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             let _ = writeln!(out, "    sub x9, x9, w10, sxtw #{}", shift);
             let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
         }
-        Instr::Call { dst, name, args, ret_width, fixed, variadic, ret_float } => {
-            // 寄存器可容纳的参数数：可变参数函数下，仅固定参数进寄存器（≤8）；否则前 8 个进寄存器。
-            let nreg = if *variadic { (*fixed).min(8) } else { args.len().min(8) };
-            let stack_args = &args[nreg..];
-            let space = (stack_args.len() * 8).div_ceil(16) * 16;
+        Instr::Call {
+            dst,
+            name,
+            args,
+            arg_floats,
+            arg_aggs,
+            ret_width,
+            ret_agg,
+            ret_buf,
+            fixed,
+            variadic,
+            ret_float,
+        } => {
+            let items: Vec<(bool, Option<usize>)> = (0..args.len())
+                .map(|i| {
+                    (
+                        arg_floats.get(i).copied().unwrap_or(false),
+                        arg_aggs.get(i).copied().flatten(),
+                    )
+                })
+                .collect();
+            let (classes, stack_bytes) = classify_aapcs64(&items, *variadic, *fixed);
+            let space = stack_bytes.div_ceil(16) * 16;
             if space > 0 {
                 let _ = writeln!(out, "    sub sp, sp, #{}", space);
             }
-            // 栈传参（含可变参数与第 9+ 个参数），每个 8 字节，从 sp 起步
-            for (k, a) in stack_args.iter().enumerate() {
-                let _ = writeln!(out, "    ldr x9, [sp, #{}]", space + slot(*a));
-                let _ = writeln!(out, "    str x9, [sp, #{}]", k * 8);
+            // sub sp 之后，局部槽位访问需 +space。
+            let r = |t: usize| space + slot(t);
+            // 栈实参（scratch 用 x9/x10，不碰参数寄存器 x0-x7）
+            for (i, (a, c)) in args.iter().zip(classes.iter()).enumerate() {
+                if let Cls::Stack { off, dwords } = c {
+                    if arg_aggs.get(i).copied().flatten().is_some() {
+                        // 结构体：实参 temp 存地址，逐 dword 从 [addr] 拷到栈实参区
+                        let _ = writeln!(out, "    ldr x9, [sp, #{}]", r(*a));
+                        for k in 0..*dwords {
+                            let _ = writeln!(out, "    ldr x10, [x9, #{}]", k * 8);
+                            let _ = writeln!(out, "    str x10, [sp, #{}]", off + k * 8);
+                        }
+                    } else {
+                        let _ = writeln!(out, "    ldr x9, [sp, #{}]", r(*a));
+                        let _ = writeln!(out, "    str x9, [sp, #{}]", off);
+                    }
+                }
             }
-            // 寄存器参数 x0..x{nreg-1}
-            for (i, a) in args.iter().take(nreg).enumerate() {
-                let _ = writeln!(out, "    ldr x{}, [sp, #{}]", i, space + slot(*a));
+            // 寄存器实参
+            for (a, c) in args.iter().zip(classes.iter()) {
+                match c {
+                    Cls::Int(reg) => {
+                        let _ = writeln!(out, "    ldr x{}, [sp, #{}]", reg, r(*a));
+                    }
+                    Cls::Fp(reg) => {
+                        let _ = writeln!(out, "    ldr d{}, [sp, #{}]", reg, r(*a));
+                    }
+                    Cls::IntRegs(regs) => {
+                        // 结构体：实参 temp 存地址，逐 dword 装入连续整型寄存器
+                        let _ = writeln!(out, "    ldr x9, [sp, #{}]", r(*a));
+                        for (k, reg) in regs.iter().enumerate() {
+                            let _ = writeln!(out, "    ldr x{}, [x9, #{}]", reg, k * 8);
+                        }
+                    }
+                    Cls::Stack { .. } => {}
+                }
+            }
+            // 大结构体返回：&缓冲区放入 x8（独立于参数寄存器）。
+            if matches!(ret_agg, Some(sz) if *sz > 16) {
+                if let Some(buf) = ret_buf {
+                    let _ = writeln!(out, "    add x8, sp, #{}", r(*buf));
+                }
             }
             let _ = writeln!(out, "    bl _{}", name);
             if space > 0 {
                 let _ = writeln!(out, "    add sp, sp, #{}", space);
             }
-            if *ret_float {
-                let _ = writeln!(out, "    str d0, [sp, #{}]", slot(*dst));
-            } else if *ret_width == 8 {
-                let _ = writeln!(out, "    str x0, [sp, #{}]", slot(*dst));
-            } else {
-                let _ = writeln!(out, "    str w0, [sp, #{}]", slot(*dst));
+            match ret_agg {
+                Some(size) if *size <= 16 => {
+                    // 小结构体经 x0:x1 返回，写入缓冲区
+                    if let Some(buf) = ret_buf {
+                        let _ = writeln!(out, "    str x0, [sp, #{}]", slot(*buf));
+                        if *size > 8 {
+                            let _ = writeln!(out, "    str x1, [sp, #{}]", slot(*buf + 8));
+                        }
+                    }
+                }
+                Some(_) => {} // 大结构体已由被调方经 x8 写好
+                None => {
+                    if *ret_float {
+                        let _ = writeln!(out, "    str d0, [sp, #{}]", slot(*dst));
+                    } else if *ret_width == 8 {
+                        let _ = writeln!(out, "    str x0, [sp, #{}]", slot(*dst));
+                    } else {
+                        let _ = writeln!(out, "    str w0, [sp, #{}]", slot(*dst));
+                    }
+                }
             }
         }
         Instr::Bin { dst, op, lhs, rhs } => {
@@ -264,13 +420,36 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, out: &mut String) {
             }
             let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
         }
-        Instr::Return { src, is_float, width } => {
-            if *is_float {
-                let _ = writeln!(out, "    ldr d0, [sp, #{}]", slot(*src));
-            } else if *width == 8 {
-                let _ = writeln!(out, "    ldr x0, [sp, #{}]", slot(*src));
-            } else {
-                let _ = writeln!(out, "    ldr w0, [sp, #{}]", slot(*src));
+        Instr::Return { src, is_float, width, agg } => {
+            match agg {
+                Some(size) if *size <= 16 => {
+                    // src 存结构体地址，经 x0:x1 返回
+                    let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*src));
+                    out.push_str("    ldr x0, [x9]\n");
+                    if *size > 8 {
+                        out.push_str("    ldr x1, [x9, #8]\n");
+                    }
+                }
+                Some(size) => {
+                    // 大结构体：经隐式返回指针(x8 已存入 sret 槽)回写，并在 x0 返回该指针
+                    let s = sret_slot.expect("sret slot for large struct return");
+                    let _ = writeln!(out, "    ldr x11, [sp, #{}]", slot(s)); // 目标指针
+                    let _ = writeln!(out, "    ldr x10, [sp, #{}]", slot(*src)); // 结构体地址
+                    for k in 0..size.div_ceil(8) {
+                        let _ = writeln!(out, "    ldr x9, [x10, #{}]", k * 8);
+                        let _ = writeln!(out, "    str x9, [x11, #{}]", k * 8);
+                    }
+                    out.push_str("    mov x0, x11\n");
+                }
+                None => {
+                    if *is_float {
+                        let _ = writeln!(out, "    ldr d0, [sp, #{}]", slot(*src));
+                    } else if *width == 8 {
+                        let _ = writeln!(out, "    ldr x0, [sp, #{}]", slot(*src));
+                    } else {
+                        let _ = writeln!(out, "    ldr w0, [sp, #{}]", slot(*src));
+                    }
+                }
             }
             if frame > 0 {
                 let _ = writeln!(out, "    add sp, sp, #{}", frame);
@@ -337,13 +516,82 @@ mod tests {
     use super::*;
     use crate::ir::{BinOp, Function, Instr, Program};
 
+    /// 全流程编译到 arm64 (Mach-O) 汇编字符串，用于 ABI 意图断言。
+    /// （本机无法汇编/运行 Mach-O，故 arm64 的 AAPCS64 行为以汇编断言校验，
+    /// 真正的端到端验证需在 Apple Silicon 上跑集成测试。）
+    fn asm_arm64(src: &str) -> String {
+        crate::compile_to_asm_target(src, crate::Target::Arm64).unwrap()
+    }
+
+    #[test]
+    fn arm64_double_param_in_fp_reg() {
+        // n→x0(整型组), x→d0(FP 组)，两组独立计数
+        let asm = asm_arm64("double f(int n, double x){ return x; } int main(){ return 0; }");
+        assert!(asm.contains("str w0, [sp, #0]")); // int 形参 n 落自 x0
+        assert!(asm.contains("str d0, [sp, #8]")); // double 形参 x 落自 d0
+    }
+
+    #[test]
+    fn arm64_double_args_passed_in_d_regs() {
+        let asm = asm_arm64("double add(double a, double b){ return a+b; } int main(){ double r = add(1.0, 2.0); return 0; }");
+        assert!(asm.contains("ldr d0, [sp")); // 实参 a → d0
+        assert!(asm.contains("ldr d1, [sp")); // 实参 b → d1
+    }
+
+    #[test]
+    fn arm64_struct_arg_small_in_int_regs() {
+        // 16 字节结构体形参经 x0:x1 传入，被调方落到连续槽位
+        let asm = asm_arm64("struct P{int x;int y;}; int s(struct P p){ return p.x+p.y; } int main(){ return 0; }");
+        let body = &asm[..asm.find("_main:").unwrap_or(asm.len())]; // 取 _s 函数体
+        assert!(body.contains("str x0, [sp, #0]"));
+        assert!(body.contains("str x1, [sp, #8]"));
+    }
+
+    #[test]
+    fn arm64_struct_arg_passed_by_loading_dwords() {
+        // 调用方把结构体逐 dword 装入 x0,x1
+        let asm = asm_arm64("struct P{int x;int y;}; int s(struct P p){ return p.x; } int main(){ struct P q; q.x=1; q.y=2; return s(q); }");
+        assert!(asm.contains("ldr x0, [x9, #0]"));
+        assert!(asm.contains("ldr x1, [x9, #8]"));
+    }
+
+    #[test]
+    fn arm64_struct_arg_large_on_stack() {
+        // >16 字节结构体经栈传参（sub sp + 逐 dword str）
+        let asm = asm_arm64("struct B{int a;int b;int c;int d;int e;}; int s(struct B b){ return b.a; } int main(){ struct B g; g.a=1; return s(g); }");
+        assert!(asm.contains("sub sp, sp, #")); // 为栈实参开辟空间
+    }
+
+    #[test]
+    fn arm64_struct_return_small_x0_x1() {
+        let asm = asm_arm64("struct P{int x;int y;}; struct P mk(){ struct P p; p.x=1; p.y=2; return p; } int main(){ return 0; }");
+        assert!(asm.contains("ldr x0, [x9]"));
+        assert!(asm.contains("ldr x1, [x9, #8]"));
+    }
+
+    #[test]
+    fn arm64_struct_return_large_uses_x8() {
+        // >16 字节结构体返回：序言保存 x8，Return 经隐式指针回写
+        let asm = asm_arm64("struct B{int a;int b;int c;int d;int e;}; struct B mk(){ struct B z; z.a=7; return z; } int main(){ return 0; }");
+        assert!(asm.contains("str x8, [sp")); // 序言保存隐式返回指针
+        assert!(asm.contains("mov x0, x11")); // 返回时把指针放回 x0
+    }
+
+    #[test]
+    fn arm64_variadic_doubles_still_go_on_stack() {
+        // Apple 约定：可变参数（含 double）一律压栈；固定的格式串仍走 x0
+        let asm = asm_arm64("int printf(char* fmt, ...); int main(){ printf(\"%f\", 3.5); return 0; }");
+        assert!(asm.contains("bl _printf"));
+        assert!(asm.contains("sub sp, sp, #")); // double 实参压栈
+    }
+
     fn gen(func_body: Vec<Instr>, frame_bytes: usize) -> String {
         generate(&Program {
             functions: vec![Function {
                 name: "main".to_string(),
                 body: func_body,
                 frame_bytes,
-            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
@@ -353,7 +601,7 @@ mod tests {
     #[test]
     fn codegen_const_return() {
         let asm = gen(
-            vec![Instr::Const { dst: 0, value: 42 }, Instr::Return { src: 0, is_float: false, width: 4 }],
+            vec![Instr::Const { dst: 0, value: 42 }, Instr::Return { src: 0, is_float: false, width: 4, agg: None }],
             8,
         );
         assert!(asm.contains(".globl _main"));
@@ -369,7 +617,7 @@ mod tests {
                 Instr::Const { dst: 0, value: 1 },
                 Instr::Const { dst: 8, value: 2 },
                 Instr::Bin { dst: 16, op: BinOp::Add, lhs: 0, rhs: 8 },
-                Instr::Return { src: 16, is_float: false, width: 4 },
+                Instr::Return { src: 16, is_float: false, width: 4, agg: None },
             ],
             24,
         );
@@ -385,7 +633,7 @@ mod tests {
                 Instr::Const { dst: 0, value: 17 },
                 Instr::Const { dst: 8, value: 5 },
                 Instr::Bin { dst: 16, op: BinOp::Mod, lhs: 0, rhs: 8 },
-                Instr::Return { src: 16, is_float: false, width: 4 },
+                Instr::Return { src: 16, is_float: false, width: 4, agg: None },
             ],
             24,
         );
@@ -400,7 +648,7 @@ mod tests {
                 Instr::Const { dst: 0, value: 1 },
                 Instr::Const { dst: 8, value: 2 },
                 Instr::Bin { dst: 16, op: BinOp::Lt, lhs: 0, rhs: 8 },
-                Instr::Return { src: 16, is_float: false, width: 4 },
+                Instr::Return { src: 16, is_float: false, width: 4, agg: None },
             ],
             24,
         );
@@ -418,7 +666,7 @@ mod tests {
                 Instr::Jump(0),
                 Instr::Label(1),
                 Instr::Const { dst: 8, value: 7 },
-                Instr::Return { src: 8, is_float: false, width: 4 },
+                Instr::Return { src: 8, is_float: false, width: 4, agg: None },
             ],
             16,
         );
@@ -431,7 +679,7 @@ mod tests {
     #[test]
     fn codegen_prologue_saves_fp_lr() {
         let asm = gen(
-            vec![Instr::Const { dst: 0, value: 1 }, Instr::Return { src: 0, is_float: false, width: 4 }],
+            vec![Instr::Const { dst: 0, value: 1 }, Instr::Return { src: 0, is_float: false, width: 4, agg: None }],
             8,
         );
         assert!(asm.contains("stp x29, x30, [sp, #-16]!"));
@@ -439,31 +687,38 @@ mod tests {
     }
 
     #[test]
-    fn codegen_call_and_loadarg() {
+    fn codegen_call_and_params() {
         let asm = generate(&Program {
             functions: vec![Function {
                 name: "main".to_string(),
+                params: vec![crate::ir::Param { slot: 0, size: 4, is_float: false, is_aggregate: false }],
                 body: vec![
-                    Instr::LoadArg { dst: 0, index: 0, width: 4 },
                     Instr::Call {
                         dst: 8,
                         name: "puts".to_string(),
                         args: vec![0],
+                        arg_floats: vec![false],
+                        arg_aggs: vec![None],
                         ret_width: 4,
+                        ret_agg: None,
+                        ret_buf: None,
                         fixed: 1,
                         variadic: false,
                         ret_float: false,
                     },
-                    Instr::Return { src: 8, is_float: false, width: 4 },
+                    Instr::Return { src: 8, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 16,
+                ret_float: false,
+                ret_agg: None,
+                sret_slot: None,
             }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
         });
-        assert!(asm.contains("str w0, [sp, #0]"));
-        assert!(asm.contains("ldr x0, [sp, #0]"));
+        assert!(asm.contains("str w0, [sp, #0]")); // 第 0 个形参从 x0 落到槽位
+        assert!(asm.contains("ldr x0, [sp, #0]")); // 调用 puts 时把实参装入 x0
         assert!(asm.contains("bl _puts"));
     }
 
@@ -474,10 +729,10 @@ mod tests {
                 name: "main".to_string(),
                 body: vec![
                     Instr::StrLit { dst: 0, index: 0 },
-                    Instr::Return { src: 0, is_float: false, width: 4 },
+                    Instr::Return { src: 0, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 8,
-            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
             strings: vec!["Hi".to_string()],
             globals: vec![],
             floats: vec![],
@@ -498,10 +753,10 @@ mod tests {
                     Instr::Label(0),
                     Instr::Jump(0),
                     Instr::Const { dst: 0, value: 0 },
-                    Instr::Return { src: 0, is_float: false, width: 4 },
+                    Instr::Return { src: 0, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 8,
-            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
@@ -515,9 +770,9 @@ mod tests {
         let asm = generate(&Program {
             functions: vec![Function {
                 name: "main".to_string(),
-                body: vec![Instr::AddrOf { dst: 8, off: 0 }, Instr::Return { src: 8, is_float: false, width: 4 }],
+                body: vec![Instr::AddrOf { dst: 8, off: 0 }, Instr::Return { src: 8, is_float: false, width: 4, agg: None }],
                 frame_bytes: 16,
-            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
@@ -535,10 +790,10 @@ mod tests {
                     Instr::LoadInd { dst: 8, addr: 0, width: 4, signed: false },
                     Instr::LoadInd { dst: 16, addr: 0, width: 1, signed: true },
                     Instr::StoreInd { addr: 0, src: 8, width: 8 },
-                    Instr::Return { src: 8, is_float: false, width: 4 },
+                    Instr::Return { src: 8, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 24,
-            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
@@ -556,10 +811,10 @@ mod tests {
                 body: vec![
                     Instr::AddrOf { dst: 0, off: 0 },
                     Instr::FieldAddr { dst: 8, base: 0, offset: 8 },
-                    Instr::Return { src: 8, is_float: false, width: 4 },
+                    Instr::Return { src: 8, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 16,
-            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
@@ -574,10 +829,10 @@ mod tests {
                 name: "main".to_string(),
                 body: vec![
                     Instr::PtrAdd { dst: 16, base: 0, index: 8, shift: 2 },
-                    Instr::Return { src: 16, is_float: false, width: 4 },
+                    Instr::Return { src: 16, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 24,
-            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
