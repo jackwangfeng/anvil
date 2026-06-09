@@ -33,6 +33,8 @@ pub enum Stmt {
         init: Option<Expr>,
     },
     ExprStmt(Expr),
+    /// 单条多声明符（如 `int a, b;`）——在当前作用域顺序展开，不引入新作用域。
+    Decls(Vec<Stmt>),
     Block(Vec<Stmt>),
     If {
         cond: Expr,

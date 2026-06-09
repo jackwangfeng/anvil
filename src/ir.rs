@@ -377,6 +377,12 @@ impl<'a> Lowerer<'a> {
             Stmt::ExprStmt(e) => {
                 let _ = self.lower_expr(e);
             }
+            Stmt::Decls(stmts) => {
+                // 多声明符：在当前作用域顺序展开（不新建作用域）
+                for st in stmts {
+                    self.lower_stmt(st);
+                }
+            }
             Stmt::Empty => {}
             Stmt::Block(stmts) => {
                 self.push_scope();

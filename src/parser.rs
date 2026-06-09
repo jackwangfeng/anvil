@@ -222,13 +222,13 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// 类型说明符：基础类型 / struct|union（含内联定义）/ enum / typedef 名，后跟 `*`。
-    fn parse_type_specifier(&mut self) -> Option<Type> {
+    /// 基础类型说明符（不含指针 `*`）：int/char/long/double/void、struct|union、enum、typedef 名。
+    fn parse_base_type(&mut self) -> Option<Type> {
         // 跳过前导 const 限定符
         while *self.peek_kind() == TokenKind::KwConst {
             self.pos += 1;
         }
-        let mut ty = match self.peek_kind() {
+        let ty = match self.peek_kind() {
             TokenKind::KwVoid => {
                 self.pos += 1;
                 Type::Void
@@ -296,6 +296,12 @@ impl<'a> Parser<'a> {
             }
             _ => return None,
         };
+        Some(ty)
+    }
+
+    /// 类型说明符：基础类型后跟零个或多个指针 `*`。
+    fn parse_type_specifier(&mut self) -> Option<Type> {
+        let mut ty = self.parse_base_type()?;
         while *self.peek_kind() == TokenKind::Star {
             self.pos += 1;
             ty = Type::Pointer(Box::new(ty));
@@ -303,49 +309,71 @@ impl<'a> Parser<'a> {
         Some(ty)
     }
 
-    /// 解析函数定义或原型声明。原型返回 None（仅注册签名）。
-    fn parse_func_or_proto(&mut self) -> Result<Option<FuncDef>, CompileError> {
-        let ret = self.parse_type_specifier().ok_or_else(|| {
-            CompileError::new(self.tokens[self.pos].span, "expected return type".to_string())
-        })?;
-        let name = self.expect_ident()?;
-        // 非 '(' → 全局变量声明
-        if *self.peek_kind() != TokenKind::LParen {
-            let mut ty = ret;
-            if *self.peek_kind() == TokenKind::LBracket {
-                self.pos += 1;
-                let n = match self.peek_kind() {
-                    TokenKind::IntLit(v) => *v as usize,
-                    _ => {
-                        return Err(CompileError::new(
-                            self.tokens[self.pos].span,
-                            "expected array size".to_string(),
-                        ))
-                    }
-                };
-                self.pos += 1;
-                self.expect(&TokenKind::RBracket)?;
-                ty = Type::Array(Box::new(ty), n);
-            }
-            let mut init = None;
-            if *self.peek_kind() == TokenKind::Assign {
-                self.pos += 1;
-                let e = self.parse_expr()?;
-                match e {
-                    Expr::IntLit(v) => init = Some(v),
-                    _ => {
-                        return Err(CompileError::new(
-                            self.tokens[self.pos].span,
-                            "global initializer must be an integer constant".to_string(),
-                        ))
-                    }
+    /// 注册一个全局变量声明符（数组后缀 + 可选整数常量初始化；不消费分号）。
+    fn parse_global_declarator(&mut self, mut ty: Type, name: String) -> Result<(), CompileError> {
+        if *self.peek_kind() == TokenKind::LBracket {
+            self.pos += 1;
+            let n = match self.peek_kind() {
+                TokenKind::IntLit(v) => *v as usize,
+                _ => {
+                    return Err(CompileError::new(
+                        self.tokens[self.pos].span,
+                        "expected array size".to_string(),
+                    ))
+                }
+            };
+            self.pos += 1;
+            self.expect(&TokenKind::RBracket)?;
+            ty = Type::Array(Box::new(ty), n);
+        }
+        let mut init = None;
+        if *self.peek_kind() == TokenKind::Assign {
+            self.pos += 1;
+            let e = self.parse_expr()?;
+            match e {
+                Expr::IntLit(v) => init = Some(v),
+                _ => {
+                    return Err(CompileError::new(
+                        self.tokens[self.pos].span,
+                        "global initializer must be an integer constant".to_string(),
+                    ))
                 }
             }
+        }
+        self.global_types.insert(name.clone(), ty.clone());
+        self.globals.push(Global { name, ty, init });
+        Ok(())
+    }
+
+    /// 解析函数定义或原型声明。原型返回 None（仅注册签名）。
+    fn parse_func_or_proto(&mut self) -> Result<Option<FuncDef>, CompileError> {
+        // 基础类型在多个声明符间共享；指针 `*` 是每个声明符各自的。
+        let base = self.parse_base_type().ok_or_else(|| {
+            CompileError::new(self.tokens[self.pos].span, "expected return type".to_string())
+        })?;
+        let mut ty = base.clone();
+        while *self.peek_kind() == TokenKind::Star {
+            self.pos += 1;
+            ty = Type::Pointer(Box::new(ty));
+        }
+        let name = self.expect_ident()?;
+        // 非 '(' → 全局变量声明（可多声明符）
+        if *self.peek_kind() != TokenKind::LParen {
+            self.parse_global_declarator(ty, name)?;
+            while *self.peek_kind() == TokenKind::Comma {
+                self.pos += 1;
+                let mut t = base.clone();
+                while *self.peek_kind() == TokenKind::Star {
+                    self.pos += 1;
+                    t = Type::Pointer(Box::new(t));
+                }
+                let nm = self.expect_ident()?;
+                self.parse_global_declarator(t, nm)?;
+            }
             self.expect(&TokenKind::Semicolon)?;
-            self.global_types.insert(name.clone(), ty.clone());
-            self.globals.push(Global { name, ty, init });
             return Ok(None);
         }
+        let ret = ty;
         self.expect(&TokenKind::LParen)?;
         let mut params = Vec::new();
         let mut variadic = false;
@@ -483,34 +511,54 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_declaration(&mut self) -> Result<Stmt, CompileError> {
-        let mut ty = self
-            .parse_type_specifier()
+        // 基础类型在多个声明符间共享；指针 `*` 与数组 `[N]` 是每个声明符各自的。
+        let base = self
+            .parse_base_type()
             .expect("parse_declaration called without a type");
-        let name = self.expect_ident()?;
-        // 数组后缀 name[N]
-        if *self.peek_kind() == TokenKind::LBracket {
-            self.pos += 1;
-            let n = match self.peek_kind() {
-                TokenKind::IntLit(v) => *v as usize,
-                _ => {
-                    return Err(CompileError::new(
-                        self.tokens[self.pos].span,
-                        "expected array size".to_string(),
-                    ))
-                }
+        let mut decls = Vec::new();
+        loop {
+            // 该声明符自己的指针层级
+            let mut ty = base.clone();
+            while *self.peek_kind() == TokenKind::Star {
+                self.pos += 1;
+                ty = Type::Pointer(Box::new(ty));
+            }
+            let name = self.expect_ident()?;
+            // 数组后缀 name[N]
+            if *self.peek_kind() == TokenKind::LBracket {
+                self.pos += 1;
+                let n = match self.peek_kind() {
+                    TokenKind::IntLit(v) => *v as usize,
+                    _ => {
+                        return Err(CompileError::new(
+                            self.tokens[self.pos].span,
+                            "expected array size".to_string(),
+                        ))
+                    }
+                };
+                self.pos += 1;
+                self.expect(&TokenKind::RBracket)?;
+                ty = Type::Array(Box::new(ty), n);
+            }
+            let init = if *self.peek_kind() == TokenKind::Assign {
+                self.pos += 1;
+                Some(self.parse_expr()?)
+            } else {
+                None
             };
-            self.pos += 1;
-            self.expect(&TokenKind::RBracket)?;
-            ty = Type::Array(Box::new(ty), n);
+            decls.push(Stmt::Declare { name, ty, init });
+            if *self.peek_kind() == TokenKind::Comma {
+                self.pos += 1;
+            } else {
+                break;
+            }
         }
-        let init = if *self.peek_kind() == TokenKind::Assign {
-            self.pos += 1;
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
         self.expect(&TokenKind::Semicolon)?;
-        Ok(Stmt::Declare { name, ty, init })
+        if decls.len() == 1 {
+            Ok(decls.pop().unwrap())
+        } else {
+            Ok(Stmt::Decls(decls))
+        }
     }
 
     fn parse_block(&mut self) -> Result<Stmt, CompileError> {

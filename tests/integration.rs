@@ -729,3 +729,51 @@ fn m14_comma_in_for_clauses() {
     let src = "int main(){ int i; int j; int n = 0; for (i = 0, j = 10; i < j; i++, j--) n++; return n; }";
     assert_eq!(compile_and_run(src, "m14_comma_for"), 5);
 }
+
+// ---- M15: 单条声明多个变量 ----
+
+#[test]
+fn m15_multi_declarator_with_init() {
+    let src = "int main(){ int a = 1, b = 2, c = 3; return a + b + c; }";
+    assert_eq!(compile_and_run(src, "m15_md_init"), 6);
+}
+
+#[test]
+fn m15_multi_declarator_no_init() {
+    let src = "int main(){ int x, y; x = 4; y = 5; return x + y; }";
+    assert_eq!(compile_and_run(src, "m15_md_noinit"), 9);
+}
+
+#[test]
+fn m15_pointer_binds_per_declarator() {
+    // `int *p, q;` → p 是 int*，q 是 int；通过 p 改 q
+    let src = "int main(){ int q; int *p, r; p = &q; *p = 42; r = q; return r; }";
+    assert_eq!(compile_and_run(src, "m15_md_ptr"), 42);
+}
+
+#[test]
+fn m15_multi_declarator_array_and_scalar() {
+    let src = "int main(){ int arr[3], n; arr[0]=10; arr[1]=20; arr[2]=30; n = arr[0]+arr[1]+arr[2]; return n; }";
+    assert_eq!(compile_and_run(src, "m15_md_arr"), 60);
+}
+
+#[test]
+fn m15_long_multi_declarator() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ long a = 3000000000, b = 3000000000; printf(\"%ld\\n\", a + b); return 0; }",
+        "m15_md_long",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "6000000000\n");
+}
+
+#[test]
+fn m15_global_multi_declarator() {
+    // 全局单条多声明符（含 long 与指针绑定）
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint a, b = 5, c = 10;\nlong big = 3000000000;\nint main(){ a = 1; printf(\"%d %d %d %ld\\n\", a, b, c, big); return b + c; }",
+        "m15_global_md",
+    );
+    assert_eq!(code, 15);
+    assert_eq!(out, "1 5 10 3000000000\n");
+}
