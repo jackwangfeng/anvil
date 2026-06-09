@@ -116,8 +116,15 @@ impl<'a> Parser<'a> {
             | TokenKind::KwChar
             | TokenKind::KwDouble
             | TokenKind::KwLong
+            | TokenKind::KwShort
+            | TokenKind::KwUnsigned
+            | TokenKind::KwSigned
             | TokenKind::KwVoid
             | TokenKind::KwConst
+            | TokenKind::KwStatic
+            | TokenKind::KwExtern
+            | TokenKind::KwRegister
+            | TokenKind::KwAuto
             | TokenKind::KwStruct
             | TokenKind::KwUnion
             | TokenKind::KwEnum => true,
@@ -222,36 +229,72 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// 基础类型说明符（不含指针 `*`）：int/char/long/double/void、struct|union、enum、typedef 名。
+    /// 消费一段整型说明符关键字组合，归一为 Char / Long / Int。
+    /// `unsigned`/`signed` 不区分符号性(无符号语义未实现)，`short` 视作 int(无 16 位)。
+    fn parse_integer_type(&mut self) -> Type {
+        let mut is_char = false;
+        let mut long_count = 0;
+        loop {
+            match self.peek_kind() {
+                TokenKind::KwChar => {
+                    is_char = true;
+                    self.pos += 1;
+                }
+                TokenKind::KwLong => {
+                    long_count += 1;
+                    self.pos += 1;
+                }
+                TokenKind::KwInt
+                | TokenKind::KwShort
+                | TokenKind::KwUnsigned
+                | TokenKind::KwSigned => {
+                    self.pos += 1;
+                }
+                _ => break,
+            }
+        }
+        if is_char {
+            Type::Char
+        } else if long_count >= 1 {
+            Type::Long
+        } else {
+            Type::Int
+        }
+    }
+
+    /// 基础类型说明符（不含指针 `*`）：int/char/long/short/unsigned/signed/double/void、struct|union、enum、typedef 名。
     fn parse_base_type(&mut self) -> Option<Type> {
-        // 跳过前导 const 限定符
-        while *self.peek_kind() == TokenKind::KwConst {
+        // 跳过前导限定符 / 存储类（const、static、extern、register、auto；语义忽略）
+        while matches!(
+            self.peek_kind(),
+            TokenKind::KwConst
+                | TokenKind::KwStatic
+                | TokenKind::KwExtern
+                | TokenKind::KwRegister
+                | TokenKind::KwAuto
+        ) {
             self.pos += 1;
+        }
+        // 整型说明符组合（int/char/long/short/unsigned/signed 任意搭配）
+        if matches!(
+            self.peek_kind(),
+            TokenKind::KwInt
+                | TokenKind::KwChar
+                | TokenKind::KwLong
+                | TokenKind::KwShort
+                | TokenKind::KwUnsigned
+                | TokenKind::KwSigned
+        ) {
+            return Some(self.parse_integer_type());
         }
         let ty = match self.peek_kind() {
             TokenKind::KwVoid => {
                 self.pos += 1;
                 Type::Void
             }
-            TokenKind::KwInt => {
-                self.pos += 1;
-                Type::Int
-            }
-            TokenKind::KwChar => {
-                self.pos += 1;
-                Type::Char
-            }
             TokenKind::KwDouble => {
                 self.pos += 1;
                 Type::Double
-            }
-            TokenKind::KwLong => {
-                // long / long int / long long / long long int 均视作 64 位整数
-                self.pos += 1;
-                while matches!(self.peek_kind(), TokenKind::KwLong | TokenKind::KwInt) {
-                    self.pos += 1;
-                }
-                Type::Long
             }
             TokenKind::KwStruct | TokenKind::KwUnion => {
                 let save = self.pos;
@@ -456,6 +499,20 @@ impl<'a> Parser<'a> {
                 self.expect(&TokenKind::Semicolon)?;
                 return Ok(Stmt::Continue);
             }
+            TokenKind::KwGoto => {
+                self.pos += 1;
+                let label = self.expect_ident()?;
+                self.expect(&TokenKind::Semicolon)?;
+                return Ok(Stmt::Goto(label));
+            }
+            // 标签：`ident :`（其后是冒号；与表达式语句区分）
+            TokenKind::Ident(_)
+                if self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(&TokenKind::Colon) =>
+            {
+                let label = self.expect_ident()?;
+                self.expect(&TokenKind::Colon)?;
+                return Ok(Stmt::Label(label));
+            }
             TokenKind::KwCase => {
                 self.pos += 1;
                 let e = self.parse_expr()?;
@@ -524,25 +581,41 @@ impl<'a> Parser<'a> {
                 ty = Type::Pointer(Box::new(ty));
             }
             let name = self.expect_ident()?;
-            // 数组后缀 name[N]
+            // 数组后缀 name[N] 或 name[]（长度由初始化列表推断）
+            let mut infer_size = false;
             if *self.peek_kind() == TokenKind::LBracket {
                 self.pos += 1;
-                let n = match self.peek_kind() {
-                    TokenKind::IntLit(v) => *v as usize,
-                    _ => {
-                        return Err(CompileError::new(
-                            self.tokens[self.pos].span,
-                            "expected array size".to_string(),
-                        ))
-                    }
-                };
-                self.pos += 1;
-                self.expect(&TokenKind::RBracket)?;
-                ty = Type::Array(Box::new(ty), n);
+                if *self.peek_kind() == TokenKind::RBracket {
+                    infer_size = true;
+                    self.pos += 1;
+                    ty = Type::Array(Box::new(ty), 0); // 占位，解析初始化列表后修正
+                } else {
+                    let n = match self.peek_kind() {
+                        TokenKind::IntLit(v) => *v as usize,
+                        _ => {
+                            return Err(CompileError::new(
+                                self.tokens[self.pos].span,
+                                "expected array size".to_string(),
+                            ))
+                        }
+                    };
+                    self.pos += 1;
+                    self.expect(&TokenKind::RBracket)?;
+                    ty = Type::Array(Box::new(ty), n);
+                }
             }
             let init = if *self.peek_kind() == TokenKind::Assign {
                 self.pos += 1;
-                Some(self.parse_expr()?)
+                let e = self.parse_initializer()?;
+                // int a[] = {...}：用初始化列表元素个数定数组长度
+                if infer_size {
+                    if let Expr::InitList(items) = &e {
+                        if let Type::Array(elem, _) = &ty {
+                            ty = Type::Array(elem.clone(), items.len());
+                        }
+                    }
+                }
+                Some(e)
             } else {
                 None
             };
@@ -558,6 +631,26 @@ impl<'a> Parser<'a> {
             Ok(decls.pop().unwrap())
         } else {
             Ok(Stmt::Decls(decls))
+        }
+    }
+
+    /// 初始化器：花括号聚合列表 `{a, b, ...}`（可嵌套、允许尾逗号）或单个赋值级表达式。
+    fn parse_initializer(&mut self) -> Result<Expr, CompileError> {
+        if *self.peek_kind() == TokenKind::LBrace {
+            self.pos += 1;
+            let mut items = Vec::new();
+            while *self.peek_kind() != TokenKind::RBrace {
+                items.push(self.parse_initializer()?);
+                if *self.peek_kind() == TokenKind::Comma {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RBrace)?;
+            Ok(Expr::InitList(items))
+        } else {
+            self.parse_assign()
         }
     }
 
@@ -775,6 +868,9 @@ impl<'a> Parser<'a> {
                 | TokenKind::KwChar
                 | TokenKind::KwDouble
                 | TokenKind::KwLong
+                | TokenKind::KwShort
+                | TokenKind::KwUnsigned
+                | TokenKind::KwSigned
                 | TokenKind::KwVoid
                 | TokenKind::KwConst
                 | TokenKind::KwStruct
@@ -857,13 +953,19 @@ impl<'a> Parser<'a> {
             }
             TokenKind::KwSizeof => {
                 self.pos += 1;
-                self.expect(&TokenKind::LParen)?;
-                if let Some(ty) = self.parse_type_specifier() {
+                // sizeof(type) 需要括号且括号后紧跟类型；否则按 sizeof 一元表达式（可不带括号）
+                if *self.peek_kind() == TokenKind::LParen && self.is_cast_ahead() {
+                    self.pos += 1; // (
+                    let ty = self.parse_type_specifier().ok_or_else(|| {
+                        CompileError::new(
+                            self.tokens[self.pos].span,
+                            "expected type in sizeof".to_string(),
+                        )
+                    })?;
                     self.expect(&TokenKind::RParen)?;
                     Ok(Expr::SizeofType(ty))
                 } else {
-                    let e = self.parse_expr()?;
-                    self.expect(&TokenKind::RParen)?;
+                    let e = self.parse_unary()?;
                     Ok(Expr::SizeofExpr(Box::new(e)))
                 }
             }
@@ -932,8 +1034,13 @@ impl<'a> Parser<'a> {
                 Ok(Expr::FloatLit(v))
             }
             TokenKind::StrLit(s) => {
-                let s = s.clone();
+                // 相邻字符串字面量拼接："foo" "bar" → "foobar"
+                let mut s = s.clone();
                 self.pos += 1;
+                while let TokenKind::StrLit(next) = self.peek_kind() {
+                    s.push_str(next);
+                    self.pos += 1;
+                }
                 Ok(Expr::StrLit(s))
             }
             TokenKind::Ident(name) => {

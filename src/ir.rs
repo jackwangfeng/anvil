@@ -205,6 +205,8 @@ struct Lowerer<'a> {
     ret_ty: Type,
     break_targets: Vec<usize>,
     continue_targets: Vec<usize>,
+    /// 命名标签（goto/label）→ IR label 号；支持前向引用（先用后定义）。
+    goto_labels: HashMap<String, usize>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -227,6 +229,17 @@ impl<'a> Lowerer<'a> {
         let l = self.next_label;
         self.next_label += 1;
         l
+    }
+
+    /// 命名标签 → IR label 号（不存在则分配，支持 goto 前向引用）。
+    fn goto_label(&mut self, name: &str) -> usize {
+        if let Some(&l) = self.goto_labels.get(name) {
+            l
+        } else {
+            let l = self.new_label();
+            self.goto_labels.insert(name.to_string(), l);
+            l
+        }
     }
 
     fn push_scope(&mut self) {
@@ -260,6 +273,82 @@ impl<'a> Lowerer<'a> {
 
     fn size_of(&self, ty: &Type) -> usize {
         crate::types::size_of(ty, self.aggregates)
+    }
+
+    /// 把表达式 `e` 求值并存入帧偏移 `off`（按 ty 转换；结构体走整体拷贝）。
+    fn store_at(&mut self, off: usize, e: &Expr, ty: &Type) {
+        let (v0, vty) = self.lower_expr(e);
+        let v = self.coerce(v0, &vty, ty);
+        let addr = self.fresh();
+        self.body.push(Instr::AddrOf { dst: addr, off });
+        self.store_into(addr, v, ty);
+    }
+
+    /// 把帧偏移 `off` 处类型为 ty 的对象零初始化（标量写 0，聚合体逐元素/字段递归）。
+    fn zero_at(&mut self, off: usize, ty: &Type) {
+        match ty {
+            Type::Array(elem, n) => {
+                let esize = self.size_of(elem);
+                for i in 0..*n {
+                    self.zero_at(off + i * esize, elem);
+                }
+            }
+            Type::Struct(name) | Type::Union(name) => {
+                let fields = self
+                    .aggregates
+                    .get(name)
+                    .map(|a| a.fields.clone())
+                    .unwrap_or_default();
+                for f in &fields {
+                    self.zero_at(off + f.offset, &f.ty);
+                }
+            }
+            _ => {
+                let z = self.fresh();
+                self.body.push(Instr::Const { dst: z, value: 0 });
+                let addr = self.fresh();
+                self.body.push(Instr::AddrOf { dst: addr, off });
+                let width = self.size_of(ty);
+                self.body.push(Instr::StoreInd { addr, src: z, width });
+            }
+        }
+    }
+
+    /// 用初始化列表 items 初始化帧偏移 off 处类型为 ty 的聚合体；缺省元素零填充。
+    fn lower_aggregate_init(&mut self, off: usize, ty: &Type, items: &[Expr]) {
+        match ty {
+            Type::Array(elem, n) => {
+                let esize = self.size_of(elem);
+                for i in 0..*n {
+                    let eoff = off + i * esize;
+                    match items.get(i) {
+                        Some(Expr::InitList(inner)) => self.lower_aggregate_init(eoff, elem, inner),
+                        Some(e) => self.store_at(eoff, e, elem),
+                        None => self.zero_at(eoff, elem),
+                    }
+                }
+            }
+            Type::Struct(name) | Type::Union(name) => {
+                let fields = self
+                    .aggregates
+                    .get(name)
+                    .map(|a| a.fields.clone())
+                    .unwrap_or_default();
+                for (i, f) in fields.iter().enumerate() {
+                    let foff = off + f.offset;
+                    match items.get(i) {
+                        Some(Expr::InitList(inner)) => self.lower_aggregate_init(foff, &f.ty, inner),
+                        Some(e) => self.store_at(foff, e, &f.ty),
+                        None => self.zero_at(foff, &f.ty),
+                    }
+                }
+            }
+            _ => {
+                if let Some(e) = items.first() {
+                    self.store_at(off, e, ty);
+                }
+            }
+        }
     }
 
     /// 把 `src` 写入地址 `addr`：结构体按值整体拷贝，标量按宽度存储。
@@ -366,12 +455,19 @@ impl<'a> Lowerer<'a> {
             }
             Stmt::Declare { name, ty, init } => {
                 let off = self.declare_var(name, ty.clone());
-                if let Some(e) = init {
-                    let (v0, vty) = self.lower_expr(e);
-                    let v = self.coerce(v0, &vty, ty);
-                    let addr = self.fresh();
-                    self.body.push(Instr::AddrOf { dst: addr, off });
-                    self.store_into(addr, v, ty);
+                match init {
+                    Some(Expr::InitList(items)) => {
+                        let ty = ty.clone();
+                        self.lower_aggregate_init(off, &ty, items);
+                    }
+                    Some(e) => {
+                        let (v0, vty) = self.lower_expr(e);
+                        let v = self.coerce(v0, &vty, ty);
+                        let addr = self.fresh();
+                        self.body.push(Instr::AddrOf { dst: addr, off });
+                        self.store_into(addr, v, ty);
+                    }
+                    None => {}
                 }
             }
             Stmt::ExprStmt(e) => {
@@ -481,6 +577,14 @@ impl<'a> Lowerer<'a> {
                 self.body.push(Instr::Jump(start));
                 self.body.push(Instr::Label(end));
                 self.pop_scope();
+            }
+            Stmt::Goto(name) => {
+                let l = self.goto_label(name);
+                self.body.push(Instr::Jump(l));
+            }
+            Stmt::Label(name) => {
+                let l = self.goto_label(name);
+                self.body.push(Instr::Label(l));
             }
             Stmt::Break => {
                 if let Some(&t) = self.break_targets.last() {
@@ -647,7 +751,11 @@ impl<'a> Lowerer<'a> {
                 (dst, Type::Int)
             }
             Expr::SizeofExpr(inner) => {
-                let ty = self.type_of(inner);
+                // sizeof 不让数组退化为指针：sizeof arr 应得整个数组大小
+                let ty = match inner.as_ref() {
+                    Expr::Var(name) => self.var_type(name).unwrap_or(Type::Int),
+                    _ => self.type_of(inner),
+                };
                 let value = self.size_of(&ty) as i64;
                 let dst = self.fresh();
                 self.body.push(Instr::Const { dst, value });
@@ -662,6 +770,18 @@ impl<'a> Lowerer<'a> {
                 // 求值 first（仅副作用，丢弃结果），整体取 second 的值与类型
                 let _ = self.lower_expr(first);
                 self.lower_expr(second)
+            }
+            Expr::InitList(items) => {
+                // 初始化列表只应出现在聚合体声明的初始化中（由 Declare 特判处理）；
+                // 若作为普通值出现，退化为其首个元素。
+                match items.first() {
+                    Some(e) => self.lower_expr(e),
+                    None => {
+                        let dst = self.fresh();
+                        self.body.push(Instr::Const { dst, value: 0 });
+                        (dst, Type::Int)
+                    }
+                }
             }
             Expr::Unary { op, operand } => {
                 let (src, ty) = self.lower_expr(operand);
@@ -906,6 +1026,30 @@ impl<'a> Lowerer<'a> {
             }
             return (dst, pty.decay());
         }
+        // 两个指针：比较走 64 位；相减得元素个数（字节差 / sizeof(elem)）
+        if l_ptr && r_ptr {
+            if is_compare(op) {
+                let dst = self.fresh();
+                self.body.push(Instr::BinL { dst, op: lower_binop(op), lhs: l, rhs: r });
+                return (dst, Type::Int);
+            }
+            if op == BinaryOp::Sub {
+                let diff = self.fresh();
+                self.body.push(Instr::BinL { dst: diff, op: BinOp::Sub, lhs: l, rhs: r });
+                let elem = lty.decay().pointee().cloned().unwrap_or(Type::Char);
+                let esize = self.size_of(&elem).max(1);
+                if esize == 1 {
+                    return (diff, Type::Long);
+                }
+                let szt0 = self.fresh();
+                self.body.push(Instr::Const { dst: szt0, value: esize as i64 });
+                // 32 位常量需符号扩展为干净的 64 位再喂给 BinL（否则高 32 位为栈残留）
+                let szt = self.coerce(szt0, &Type::Int, &Type::Long);
+                let q = self.fresh();
+                self.body.push(Instr::BinL { dst: q, op: BinOp::Div, lhs: diff, rhs: szt });
+                return (q, Type::Long);
+            }
+        }
         // 浮点运算：任一操作数为 double 即走 FP 路径（int 操作数提升为 double）
         if matches!(lty, Type::Double) || matches!(rty, Type::Double) {
             let lf = self.coerce(l, &lty, &Type::Double);
@@ -1011,6 +1155,7 @@ impl<'a> Lowerer<'a> {
             }
             Expr::Assign { value, .. } => self.type_of(value),
             Expr::Comma { second, .. } => self.type_of(second),
+            Expr::InitList(items) => items.first().map(|e| self.type_of(e)).unwrap_or(Type::Int),
         }
     }
 
@@ -1144,6 +1289,7 @@ fn lower_func(
         ret_ty: f.ret.clone(),
         break_targets: Vec::new(),
         continue_targets: Vec::new(),
+        goto_labels: HashMap::new(),
     };
     let ret_agg = match f.ret {
         Type::Struct(_) | Type::Union(_) => Some(lw.size_of(&f.ret)),

@@ -777,3 +777,166 @@ fn m15_global_multi_declarator() {
     assert_eq!(code, 15);
     assert_eq!(out, "1 5 10 3000000000\n");
 }
+
+// ---- M16: unsigned/short、八进制字面量、sizeof 不带括号 ----
+
+#[test]
+fn m16_unsigned_and_short() {
+    // unsigned/short 当作 int 处理；unsigned long 仍是 64 位
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ unsigned int u = 100; short s = 7; unsigned long ul = 5000000000; printf(\"%d %d %ld\\n\", u, s, ul); return 0; }",
+        "m16_uns",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "100 7 5000000000\n");
+}
+
+#[test]
+fn m16_unsigned_char() {
+    // unsigned char → char
+    let src = "int main(){ unsigned char c = 65; return c; }";
+    assert_eq!(compile_and_run(src, "m16_uchar"), 65);
+}
+
+#[test]
+fn m16_octal_literal() {
+    // 0777 = 511，010 = 8（用 printf 避免退出码 8 位截断）
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ printf(\"%d %d\\n\", 0777, 010); return 0; }",
+        "m16_octal",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "511 8\n");
+}
+
+#[test]
+fn m16_octal_zero_still_zero() {
+    let src = "int main(){ int z = 0; return z + 5; }";
+    assert_eq!(compile_and_run(src, "m16_oct0"), 5);
+}
+
+#[test]
+fn m16_sizeof_without_parens_var() {
+    // sizeof 变量、表达式不需括号
+    let src = "int main(){ int x; double d; return sizeof x + sizeof d; }"; // 4 + 8 = 12
+    assert_eq!(compile_and_run(src, "m16_szv"), 12);
+}
+
+#[test]
+fn m16_sizeof_array_not_decayed() {
+    // sizeof arr 得整个数组大小（不退化为指针）
+    let src = "int main(){ int arr[5]; return sizeof arr; }"; // 5*4 = 20
+    assert_eq!(compile_and_run(src, "m16_szarr"), 20);
+}
+
+#[test]
+fn m16_sizeof_type_still_works() {
+    // 带括号的 sizeof(type) 仍可用
+    let src = "int main(){ return sizeof(long) + sizeof(char); }"; // 8 + 1 = 9
+    assert_eq!(compile_and_run(src, "m16_szty"), 9);
+}
+
+// ---- M17: 存储类、科学计数法、字符串拼接、goto ----
+
+#[test]
+fn m17_storage_class_keywords() {
+    // static/extern/register 语法被接受（语义忽略）：静态全局 + register 局部
+    let src = "static int g = 41; int helper(){ return g; } int main(){ register int x = helper(); return x + 1; }";
+    assert_eq!(compile_and_run(src, "m17_storage"), 42);
+}
+
+#[test]
+fn m17_scientific_notation() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ printf(\"%f %f %f\\n\", 1e3, 2.5e-2, 1E6); return 0; }",
+        "m17_sci",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "1000.000000 0.025000 1000000.000000\n");
+}
+
+#[test]
+fn m17_string_concatenation() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ printf(\"%s\\n\", \"Hello, \" \"world\" \"!\"); return 0; }",
+        "m17_strcat",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "Hello, world!\n");
+}
+
+#[test]
+fn m17_goto_forward() {
+    // 向前跳过中间代码
+    let src = "int main(){ int x = 1; goto skip; x = 99; skip: return x; }";
+    assert_eq!(compile_and_run(src, "m17_goto_fwd"), 1);
+}
+
+#[test]
+fn m17_goto_backward_loop() {
+    // 向后跳实现循环：0+1+2+3+4 = 10
+    let src = "int main(){ int i = 0; int sum = 0; loop: sum = sum + i; i++; if (i < 5) goto loop; return sum; }";
+    assert_eq!(compile_and_run(src, "m17_goto_bwd"), 10);
+}
+
+#[test]
+fn m17_goto_error_cleanup_pattern() {
+    // 经典 goto 错误清理：跳到统一出口
+    let src = "int f(int ok){ int rc = 0; if (!ok) { rc = -1; goto done; } rc = 5; done: return rc; } int main(){ return f(0) + 1; }"; // -1 + 1 = 0
+    assert_eq!(compile_and_run(src, "m17_goto_cleanup"), 0);
+}
+
+// ---- M18: 聚合初始化列表 + 指针比较/相减 ----
+
+#[test]
+fn m18_array_initializer() {
+    let src = "int main(){ int a[3] = {10, 20, 30}; return a[0] + a[1] + a[2]; }";
+    assert_eq!(compile_and_run(src, "m18_arr_init"), 60);
+}
+
+#[test]
+fn m18_array_initializer_inferred_size() {
+    // int a[] = {...} 长度推断；sizeof 验证
+    let src = "int main(){ int a[] = {1, 2, 3, 4, 5}; return sizeof a / sizeof a[0]; }"; // 5
+    assert_eq!(compile_and_run(src, "m18_arr_infer"), 5);
+}
+
+#[test]
+fn m18_array_zero_fill() {
+    // 不足部分零填充：{7} → [7,0,0,0,0]
+    let src = "int main(){ int z[5] = {7}; return z[0] + z[1] + z[2] + z[3] + z[4]; }";
+    assert_eq!(compile_and_run(src, "m18_arr_zero"), 7);
+}
+
+#[test]
+fn m18_array_full_zero_idiom() {
+    // {0} 惯用法全清零
+    let src = "int main(){ int b[10] = {0}; int s = 0; for (int i=0;i<10;i++) s += b[i]; return s + 5; }";
+    assert_eq!(compile_and_run(src, "m18_zero_idiom"), 5);
+}
+
+#[test]
+fn m18_struct_initializer() {
+    let src = "struct P { int x; int y; }; int main(){ struct P p = {40, 2}; return p.x + p.y; }";
+    assert_eq!(compile_and_run(src, "m18_struct_init"), 42);
+}
+
+#[test]
+fn m18_pointer_subtraction() {
+    // q - p 得元素个数
+    let src = "int main(){ int a[10]; int *p = &a[2]; int *q = &a[9]; int d = q - p; return d; }"; // 7
+    assert_eq!(compile_and_run(src, "m18_ptr_sub"), 7);
+}
+
+#[test]
+fn m18_pointer_comparison() {
+    let src = "int main(){ int a[5]; int *p = &a[1]; int *q = &a[3]; return (p < q) + (p != q) + (q > p); }"; // 1+1+1=3
+    assert_eq!(compile_and_run(src, "m18_ptr_cmp"), 3);
+}
+
+#[test]
+fn m18_pointer_walk_with_compare() {
+    // 用指针比较驱动遍历
+    let src = "int main(){ int a[4]; a[0]=1; a[1]=2; a[2]=3; a[3]=4; int *p = a; int *end = a + 4; int s = 0; while (p < end) { s += *p; p = p + 1; } return s; }"; // 10
+    assert_eq!(compile_and_run(src, "m18_ptr_walk"), 10);
+}
