@@ -21,6 +21,8 @@ pub struct FuncDef {
     pub params: Vec<(String, Type)>,
     pub ret: Type,
     pub body: Vec<Stmt>,
+    /// 是否为可变参数函数（形参以 `...` 结尾）。
+    pub variadic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,6 +82,15 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// 经函数指针的间接调用 `expr(args)`（如 `(*f)(x)`）。
+    CallPtr {
+        func: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    /// `va_start(ap, last)`：ap 为 va_list 变量（其值置为首个可变参数地址）。
+    VaStart { ap: Box<Expr> },
+    /// `va_arg(ap, ty)`：取下一个可变参数并按 ty 推进 ap。
+    VaArg { ap: Box<Expr>, ty: Type },
     Assign {
         target: Box<Expr>,
         value: Box<Expr>,

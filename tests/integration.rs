@@ -940,3 +940,57 @@ fn m18_pointer_walk_with_compare() {
     let src = "int main(){ int a[4]; a[0]=1; a[1]=2; a[2]=3; a[3]=4; int *p = a; int *end = a + 4; int s = 0; while (p < end) { s += *p; p = p + 1; } return s; }"; // 10
     assert_eq!(compile_and_run(src, "m18_ptr_walk"), 10);
 }
+
+// ---- M19: enum 当类型 / 多维数组 / 函数指针 / 用户可变参数 ----
+
+#[test]
+fn m19_enum_as_type() {
+    let src = "enum Color { RED, GREEN, BLUE }; enum Color pick(enum Color c){ return c; } int main(){ enum Color c = GREEN; return pick(c) + BLUE; }"; // 1 + 2
+    assert_eq!(compile_and_run(src, "m19_enum_ty"), 3);
+}
+
+#[test]
+fn m19_multidim_array() {
+    let src = "int main(){ int a[3][4]; for (int i=0;i<3;i++) for (int j=0;j<4;j++) a[i][j]=i*10+j; return a[2][3]; }"; // 23
+    assert_eq!(compile_and_run(src, "m19_md_arr"), 23);
+}
+
+#[test]
+fn m19_multidim_sizeof() {
+    let src = "int main(){ int a[3][4]; return sizeof a; }"; // 3*4*4 = 48
+    assert_eq!(compile_and_run(src, "m19_md_sz"), 48);
+}
+
+#[test]
+fn m19_function_pointer_variable() {
+    let src = "int add(int a,int b){return a+b;} int mul(int a,int b){return a*b;} int main(){ int (*f)(int,int) = add; int r = f(3,4); f = &mul; return r + f(5,6); }"; // 7 + 30
+    assert_eq!(compile_and_run(src, "m19_fp_var"), 37);
+}
+
+#[test]
+fn m19_function_pointer_callback() {
+    let src = "int apply(int (*op)(int,int), int x, int y){ return op(x,y); } int sub(int a,int b){return a-b;} int main(){ return apply(sub, 50, 8); }"; // 42
+    assert_eq!(compile_and_run(src, "m19_fp_cb"), 42);
+}
+
+#[test]
+fn m19_function_pointer_deref_call() {
+    let src = "int neg(int x){return -x;} int main(){ int (*f)(int) = neg; return (*f)(-42); }"; // 42
+    assert_eq!(compile_and_run(src, "m19_fp_deref"), 42);
+}
+
+#[test]
+fn m19_variadic_int() {
+    let src = "int sum(int n, ...){ va_list ap; va_start(ap, n); int t=0; for(int i=0;i<n;i++) t+=va_arg(ap,int); va_end(ap); return t; } int main(){ return sum(5, 10,20,30,40,50); }"; // 150
+    assert_eq!(compile_and_run(src, "m19_va_int"), 150);
+}
+
+#[test]
+fn m19_variadic_double() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\ndouble favg(int n, ...){ va_list ap; va_start(ap, n); double s=0; for(int i=0;i<n;i++) s+=va_arg(ap,double); va_end(ap); return s/n; } int main(){ printf(\"%f\\n\", favg(4, 1.0, 2.0, 3.0, 4.0)); return 0; }",
+        "m19_va_dbl",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "2.500000\n");
+}

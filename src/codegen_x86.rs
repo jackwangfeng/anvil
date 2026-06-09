@@ -51,8 +51,20 @@ fn gen_func(func: &Function, out: &mut String) {
         let _ = writeln!(out, "    movq %rdi, {}", loc(s, frame));
     }
     gen_params(&func.params, sret, frame, out);
+    // 可变参数：可变实参从 [rbp + 16 + 具名栈实参字节数] 开始（具名实参多走寄存器，通常为 16）。
+    let va_base = if func.variadic {
+        let items: Vec<(bool, Option<usize>)> = func
+            .params
+            .iter()
+            .map(|p| (p.is_float, if p.is_aggregate { Some(p.size) } else { None }))
+            .collect();
+        let (_, _, named_stack) = classify_sysv(&items, sret, None);
+        16 + named_stack
+    } else {
+        16
+    };
     for instr in &func.body {
-        gen_instr(instr, &func.name, frame, func.sret_slot, out);
+        gen_instr(instr, &func.name, frame, func.sret_slot, va_base, out);
     }
 }
 
@@ -71,13 +83,25 @@ enum Cls {
 /// System V 实参分类：整型组 rdi..r9（6），浮点组 xmm0..7（8），各自独立计数；
 /// 溢出按 8 字节为单位压栈。`sret` 为真时 rdi 已被隐式返回指针占用。
 /// 返回 (各项去向, 用到的 xmm 数, 栈实参区总字节数)。
-fn classify_sysv(items: &[(bool, Option<usize>)], sret: bool) -> (Vec<Cls>, usize, usize) {
+fn classify_sysv(
+    items: &[(bool, Option<usize>)],
+    sret: bool,
+    stack_after: Option<usize>,
+) -> (Vec<Cls>, usize, usize) {
     let mut int_reg = if sret { 1 } else { 0 };
     let mut xmm = 0;
     let mut soff = 0;
     let classes = items
         .iter()
-        .map(|&(is_float, agg)| {
+        .enumerate()
+        .map(|(i, &(is_float, agg))| {
+            // 自定义可变参数：index ≥ fixed 的实参一律压栈
+            if stack_after.is_some_and(|f| i >= f) {
+                let off = soff;
+                let sz = agg.map(|s| s.div_ceil(8) * 8).unwrap_or(8);
+                soff += sz;
+                return Cls::Stack { off, dwords: sz / 8 };
+            }
             if let Some(sz) = agg {
                 let ndw = sz.div_ceil(8);
                 if sz <= 16 && int_reg + ndw <= 6 {
@@ -117,7 +141,7 @@ fn gen_params(params: &[crate::ir::Param], sret: bool, frame: usize, out: &mut S
         .iter()
         .map(|p| (p.is_float, if p.is_aggregate { Some(p.size) } else { None }))
         .collect();
-    let (classes, _, _) = classify_sysv(&items, sret);
+    let (classes, _, _) = classify_sysv(&items, sret, None);
     for (p, c) in params.iter().zip(classes.iter()) {
         match c {
             Cls::Int(r) => match p.size {
@@ -199,7 +223,14 @@ fn gen_globals(globals: &[crate::ir::GlobalVar], out: &mut String) {
     }
 }
 
-fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, out: &mut String) {
+fn gen_instr(
+    instr: &Instr,
+    func: &str,
+    frame: usize,
+    sret_slot: Option<usize>,
+    va_base: usize,
+    out: &mut String,
+) {
     let m = |t: usize| loc(t, frame);
     match instr {
         Instr::Const { dst, value } => {
@@ -289,32 +320,59 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, 
                 }
             }
         }
-        Instr::PtrAdd { dst, base, index, shift } => {
+        Instr::PtrAdd { dst, base, index, size } => {
             let _ = writeln!(out, "    movq {}, %rax", m(*base));
             let _ = writeln!(out, "    movslq {}, %rcx", m(*index));
-            let _ = writeln!(out, "    leaq (%rax,%rcx,{}), %rax", 1u32 << shift);
+            scale_index(*size, out); // rcx *= size
+            out.push_str("    addq %rcx, %rax\n");
             let _ = writeln!(out, "    movq %rax, {}", m(*dst));
         }
-        Instr::PtrSub { dst, base, index, shift } => {
+        Instr::PtrSub { dst, base, index, size } => {
             let _ = writeln!(out, "    movq {}, %rax", m(*base));
             let _ = writeln!(out, "    movslq {}, %rcx", m(*index));
-            if *shift > 0 {
-                let _ = writeln!(out, "    shlq ${}, %rcx", shift);
-            }
+            scale_index(*size, out); // rcx *= size
             out.push_str("    subq %rcx, %rax\n");
             let _ = writeln!(out, "    movq %rax, {}", m(*dst));
+        }
+        Instr::FuncAddr { dst, name } => {
+            let _ = writeln!(out, "    leaq {}(%rip), %rax", name);
+            let _ = writeln!(out, "    movq %rax, {}", m(*dst));
+        }
+        Instr::VaStart { ap } => {
+            // *ap = 首个可变参数地址（rbp + va_base）
+            let _ = writeln!(out, "    leaq {}(%rbp), %rax", va_base);
+            let _ = writeln!(out, "    movq {}, %rcx", m(*ap)); // rcx = &va_list
+            out.push_str("    movq %rax, (%rcx)\n");
+        }
+        Instr::VaArg { dst, ap, width } => {
+            let _ = writeln!(out, "    movq {}, %rcx", m(*ap)); // rcx = &va_list
+            out.push_str("    movq (%rcx), %rdx\n"); // rdx = 当前遍历指针
+            if *width == 8 {
+                out.push_str("    movq (%rdx), %rax\n");
+            } else {
+                out.push_str("    movl (%rdx), %eax\n");
+            }
+            out.push_str("    addq $8, %rdx\n"); // 前进一个槽
+            out.push_str("    movq %rdx, (%rcx)\n");
+            if *width == 8 {
+                let _ = writeln!(out, "    movq %rax, {}", m(*dst));
+            } else {
+                let _ = writeln!(out, "    movl %eax, {}", m(*dst));
+            }
         }
         Instr::Call {
             dst,
             name,
+            via,
             args,
             arg_floats,
             arg_aggs,
             ret_width,
             ret_agg,
             ret_buf,
-            fixed: _,
+            fixed,
             variadic,
+            stack_varargs,
             ret_float,
         } => {
             // 大结构体返回（>16B）走隐式指针：&缓冲区放入 rdi，实参整型组从 rsi 起。
@@ -327,7 +385,9 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, 
                     )
                 })
                 .collect();
-            let (classes, xmm_used, stack_bytes) = classify_sysv(&items, sret);
+            // 自定义可变参数被调方：index ≥ fixed 的实参压栈
+            let stack_after = if *stack_varargs { Some(*fixed) } else { None };
+            let (classes, xmm_used, stack_bytes) = classify_sysv(&items, sret, stack_after);
             let space = stack_bytes.div_ceil(16) * 16;
             if space > 0 {
                 let _ = writeln!(out, "    subq ${}, %rsp", space);
@@ -376,7 +436,16 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, 
                 // 可变参数函数（如 printf）要求 al = 传入的向量(xmm)寄存器数。
                 let _ = writeln!(out, "    movb ${}, %al", xmm_used);
             }
-            let _ = writeln!(out, "    call {}@PLT", name);
+            match via {
+                // 间接调用：指针在 via 槽，载入非实参寄存器 r11 后 call *r11
+                Some(t) => {
+                    let _ = writeln!(out, "    movq {}, %r11", loc(*t, frame));
+                    out.push_str("    call *%r11\n");
+                }
+                None => {
+                    let _ = writeln!(out, "    call {}@PLT", name);
+                }
+            }
             if space > 0 {
                 let _ = writeln!(out, "    addq ${}, %rsp", space);
             }
@@ -549,6 +618,20 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, 
     }
 }
 
+/// 把 %rcx 乘以元素字节大小 size（2 的幂用移位，否则用 imulq）。
+fn scale_index(size: usize, out: &mut String) {
+    match size {
+        0 | 1 => {}
+        2 => out.push_str("    shlq $1, %rcx\n"),
+        4 => out.push_str("    shlq $2, %rcx\n"),
+        8 => out.push_str("    shlq $3, %rcx\n"),
+        16 => out.push_str("    shlq $4, %rcx\n"),
+        n => {
+            let _ = writeln!(out, "    imulq ${}, %rcx, %rcx", n);
+        }
+    }
+}
+
 fn is_compare_binop(op: &BinOp) -> bool {
     matches!(
         op,
@@ -570,7 +653,7 @@ mod tests {
                 frame_bytes,
                 ret_float: false,
                 ret_agg: None,
-                sret_slot: None,
+                sret_slot: None, variadic: false,
             }],
             strings: vec![],
             globals: vec![],
@@ -642,6 +725,7 @@ mod tests {
                     Instr::Call {
                         dst: 8,
                         name: "puts".to_string(),
+                        via: None,
                         args: vec![0],
                         arg_floats: vec![false],
                         arg_aggs: vec![None],
@@ -650,14 +734,14 @@ mod tests {
                         ret_buf: None,
                         fixed: 1,
                         variadic: false,
-                        ret_float: false,
+                        stack_varargs: false,                        ret_float: false,
                     },
                     Instr::Return { src: 8, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 16,
                 ret_float: false,
                 ret_agg: None,
-                sret_slot: None,
+                sret_slot: None, variadic: false,
             }],
             strings: vec![],
             globals: vec![],
@@ -677,6 +761,7 @@ mod tests {
                 body: vec![Instr::Call {
                     dst: 0,
                     name: "printf".to_string(),
+                    via: None,
                     args: vec![],
                     arg_floats: vec![],
                     arg_aggs: vec![],
@@ -685,12 +770,12 @@ mod tests {
                     ret_buf: None,
                     fixed: 1,
                     variadic: true,
-                    ret_float: false,
+                    stack_varargs: false,                    ret_float: false,
                 }],
                 frame_bytes: 16,
                 ret_float: false,
                 ret_agg: None,
-                sret_slot: None,
+                sret_slot: None, variadic: false,
             }],
             strings: vec![],
             globals: vec![],
@@ -715,15 +800,28 @@ mod tests {
     }
 
     #[test]
-    fn ptradd_scales_with_lea() {
+    fn ptradd_scales_by_size() {
         let asm = gen(
             vec![
-                Instr::PtrAdd { dst: 16, base: 0, index: 8, shift: 2 },
+                Instr::PtrAdd { dst: 16, base: 0, index: 8, size: 4 },
                 Instr::Return { src: 16, is_float: false, width: 8, agg: None },
             ],
             24,
         );
-        assert!(asm.contains("leaq (%rax,%rcx,4), %rax"));
+        assert!(asm.contains("shlq $2, %rcx")); // ×4 用移位
+        assert!(asm.contains("addq %rcx, %rax"));
+    }
+
+    #[test]
+    fn ptradd_nonpow2_size_uses_imul() {
+        let asm = gen(
+            vec![
+                Instr::PtrAdd { dst: 16, base: 0, index: 8, size: 12 },
+                Instr::Return { src: 16, is_float: false, width: 8, agg: None },
+            ],
+            24,
+        );
+        assert!(asm.contains("imulq $12, %rcx, %rcx")); // 非 2 的幂用乘法
     }
 
     #[test]
@@ -736,7 +834,7 @@ mod tests {
                     Instr::Return { src: 0, is_float: false, width: 8, agg: None },
                 ],
                 frame_bytes: 8,
-                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None, variadic: false,            }],
             strings: vec!["Hi".to_string()],
             globals: vec![],
             floats: vec![],

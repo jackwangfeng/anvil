@@ -82,8 +82,20 @@ fn gen_func(func: &Function, out: &mut String) {
         let _ = writeln!(out, "    str x8, [sp, #{}]", slot(s));
     }
     gen_params(&func.params, out);
+    // 可变参数：可变实参从 [x29 + 16 + 具名栈实参字节数] 开始。
+    let va_base = if func.variadic {
+        let items: Vec<(bool, Option<usize>)> = func
+            .params
+            .iter()
+            .map(|p| (p.is_float, if p.is_aggregate { Some(p.size) } else { None }))
+            .collect();
+        let (_, named_stack) = classify_aapcs64(&items, false, func.params.len());
+        16 + named_stack
+    } else {
+        16
+    };
     for instr in &func.body {
-        gen_instr(instr, &func.name, frame, func.sret_slot, out);
+        gen_instr(instr, &func.name, frame, func.sret_slot, va_base, out);
     }
 }
 
@@ -202,7 +214,14 @@ fn gen_strings(strings: &[String], out: &mut String) {
     }
 }
 
-fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, out: &mut String) {
+fn gen_instr(
+    instr: &Instr,
+    func: &str,
+    frame: usize,
+    sret_slot: Option<usize>,
+    va_base: usize,
+    out: &mut String,
+) {
     match instr {
         Instr::Const { dst, value } => {
             if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 {
@@ -293,21 +312,52 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, 
                 }
             }
         }
-        Instr::PtrAdd { dst, base, index, shift } => {
+        Instr::PtrAdd { dst, base, index, size } => {
             let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*base));
             let _ = writeln!(out, "    ldr w10, [sp, #{}]", slot(*index));
-            let _ = writeln!(out, "    add x9, x9, w10, sxtw #{}", shift);
+            out.push_str("    sxtw x10, w10\n");
+            let _ = writeln!(out, "    mov x11, #{}", size);
+            out.push_str("    madd x9, x10, x11, x9\n"); // x9 = base + index*size
             let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
         }
-        Instr::PtrSub { dst, base, index, shift } => {
+        Instr::PtrSub { dst, base, index, size } => {
             let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*base));
             let _ = writeln!(out, "    ldr w10, [sp, #{}]", slot(*index));
-            let _ = writeln!(out, "    sub x9, x9, w10, sxtw #{}", shift);
+            out.push_str("    sxtw x10, w10\n");
+            let _ = writeln!(out, "    mov x11, #{}", size);
+            out.push_str("    msub x9, x10, x11, x9\n"); // x9 = base - index*size
             let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
+        Instr::FuncAddr { dst, name } => {
+            let _ = writeln!(out, "    adrp x9, _{}@PAGE", name);
+            let _ = writeln!(out, "    add x9, x9, _{}@PAGEOFF", name);
+            let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
+        Instr::VaStart { ap } => {
+            let _ = writeln!(out, "    add x9, x29, #{}", va_base); // 首个可变参数地址
+            let _ = writeln!(out, "    ldr x10, [sp, #{}]", slot(*ap)); // x10 = &va_list
+            out.push_str("    str x9, [x10]\n");
+        }
+        Instr::VaArg { dst, ap, width } => {
+            let _ = writeln!(out, "    ldr x10, [sp, #{}]", slot(*ap)); // &va_list
+            out.push_str("    ldr x11, [x10]\n"); // 当前遍历指针
+            if *width == 8 {
+                out.push_str("    ldr x9, [x11]\n");
+            } else {
+                out.push_str("    ldr w9, [x11]\n");
+            }
+            out.push_str("    add x11, x11, #8\n");
+            out.push_str("    str x11, [x10]\n");
+            if *width == 8 {
+                let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+            } else {
+                let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
+            }
         }
         Instr::Call {
             dst,
             name,
+            via,
             args,
             arg_floats,
             arg_aggs,
@@ -316,6 +366,7 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, 
             ret_buf,
             fixed,
             variadic,
+            stack_varargs: _, // arm64：可变参数本就一律压栈，无需区分
             ret_float,
         } => {
             let items: Vec<(bool, Option<usize>)> = (0..args.len())
@@ -374,7 +425,16 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, 
                     let _ = writeln!(out, "    add x8, sp, #{}", r(*buf));
                 }
             }
-            let _ = writeln!(out, "    bl _{}", name);
+            match via {
+                // 间接调用：指针在 via 槽（sub sp 后偏移 +space），载入 x9 后 blr
+                Some(t) => {
+                    let _ = writeln!(out, "    ldr x9, [sp, #{}]", r(*t));
+                    out.push_str("    blr x9\n");
+                }
+                None => {
+                    let _ = writeln!(out, "    bl _{}", name);
+                }
+            }
             if space > 0 {
                 let _ = writeln!(out, "    add sp, sp, #{}", space);
             }
@@ -696,7 +756,7 @@ mod tests {
                 name: "main".to_string(),
                 body: func_body,
                 frame_bytes,
-                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None, variadic: false,            }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
@@ -801,6 +861,7 @@ mod tests {
                     Instr::Call {
                         dst: 8,
                         name: "puts".to_string(),
+                        via: None,
                         args: vec![0],
                         arg_floats: vec![false],
                         arg_aggs: vec![None],
@@ -809,14 +870,14 @@ mod tests {
                         ret_buf: None,
                         fixed: 1,
                         variadic: false,
-                        ret_float: false,
+                        stack_varargs: false,                        ret_float: false,
                     },
                     Instr::Return { src: 8, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 16,
                 ret_float: false,
                 ret_agg: None,
-                sret_slot: None,
+                sret_slot: None, variadic: false,
             }],
             strings: vec![],
             globals: vec![],
@@ -837,7 +898,7 @@ mod tests {
                     Instr::Return { src: 0, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 8,
-                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None, variadic: false,            }],
             strings: vec!["Hi".to_string()],
             globals: vec![],
             floats: vec![],
@@ -861,7 +922,7 @@ mod tests {
                     Instr::Return { src: 0, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 8,
-                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None, variadic: false,            }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
@@ -877,7 +938,7 @@ mod tests {
                 name: "main".to_string(),
                 body: vec![Instr::AddrOf { dst: 8, off: 0 }, Instr::Return { src: 8, is_float: false, width: 4, agg: None }],
                 frame_bytes: 16,
-                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None, variadic: false,            }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
@@ -898,7 +959,7 @@ mod tests {
                     Instr::Return { src: 8, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 24,
-                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None, variadic: false,            }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
@@ -919,7 +980,7 @@ mod tests {
                     Instr::Return { src: 8, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 16,
-                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None, variadic: false,            }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
@@ -933,15 +994,16 @@ mod tests {
             functions: vec![Function {
                 name: "main".to_string(),
                 body: vec![
-                    Instr::PtrAdd { dst: 16, base: 0, index: 8, shift: 2 },
+                    Instr::PtrAdd { dst: 16, base: 0, index: 8, size: 4 },
                     Instr::Return { src: 16, is_float: false, width: 4, agg: None },
                 ],
                 frame_bytes: 24,
-                params: vec![], ret_float: false, ret_agg: None, sret_slot: None,            }],
+                params: vec![], ret_float: false, ret_agg: None, sret_slot: None, variadic: false,            }],
             strings: vec![],
             globals: vec![],
             floats: vec![],
         });
-        assert!(asm.contains("add x9, x9, w10, sxtw #2"));
+        assert!(asm.contains("madd x9, x10, x11, x9"));
+        assert!(asm.contains("mov x11, #4"));
     }
 }

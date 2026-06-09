@@ -71,7 +71,7 @@ impl<'a> Parser<'a> {
                     self.parse_aggregate_def()?;
                     self.expect(&TokenKind::Semicolon)?;
                 }
-                TokenKind::KwEnum => {
+                TokenKind::KwEnum if self.is_aggregate_def() => {
                     self.parse_enum_def()?;
                     self.expect(&TokenKind::Semicolon)?;
                 }
@@ -128,7 +128,7 @@ impl<'a> Parser<'a> {
             | TokenKind::KwStruct
             | TokenKind::KwUnion
             | TokenKind::KwEnum => true,
-            TokenKind::Ident(name) => self.typedefs.contains_key(name),
+            TokenKind::Ident(name) => name == "va_list" || self.typedefs.contains_key(name),
             _ => false,
         }
     }
@@ -328,6 +328,11 @@ impl<'a> Parser<'a> {
                 }
                 Type::Int
             }
+            TokenKind::Ident(name) if name == "va_list" => {
+                // va_list 用一个指针表示（指向当前可变参数位置）
+                self.pos += 1;
+                Type::Pointer(Box::new(Type::Void))
+            }
             TokenKind::Ident(name) => {
                 if let Some(t) = self.typedefs.get(name) {
                     let t = t.clone();
@@ -340,6 +345,52 @@ impl<'a> Parser<'a> {
             _ => return None,
         };
         Some(ty)
+    }
+
+    /// 尝试解析函数指针声明符 `(*name)(参数表)`，成功则返回 (名字, FnPtr 类型)。
+    /// 参数表按括号配平跳过（参数类型不参与代码生成）。`ret` 为返回类型。
+    fn try_fnptr_declarator(
+        &mut self,
+        ret: &Type,
+    ) -> Result<Option<(String, Type)>, CompileError> {
+        let is_fnptr = *self.peek_kind() == TokenKind::LParen
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Star)
+            );
+        if !is_fnptr {
+            return Ok(None);
+        }
+        self.pos += 1; // (
+        self.pos += 1; // *
+        while *self.peek_kind() == TokenKind::Star {
+            self.pos += 1; // 多级指针，仍按函数指针处理
+        }
+        let name = if let TokenKind::Ident(n) = self.peek_kind() {
+            let n = n.clone();
+            self.pos += 1;
+            n
+        } else {
+            String::new()
+        };
+        self.expect(&TokenKind::RParen)?;
+        self.expect(&TokenKind::LParen)?;
+        let mut depth = 1;
+        while depth > 0 {
+            match self.peek_kind() {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => depth -= 1,
+                TokenKind::Eof => {
+                    return Err(CompileError::new(
+                        self.tokens[self.pos].span,
+                        "unterminated function-pointer parameter list".to_string(),
+                    ))
+                }
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        Ok(Some((name, Type::FnPtr(Box::new(ret.clone())))))
     }
 
     /// 类型说明符：基础类型后跟零个或多个指针 `*`。
@@ -437,6 +488,16 @@ impl<'a> Parser<'a> {
                         "expected parameter type".to_string(),
                     )
                 })?;
+                // 函数指针参数 RET (*name)(...)
+                if let Some((pname, fty)) = self.try_fnptr_declarator(&ty)? {
+                    params.push((pname, fty));
+                    if *self.peek_kind() == TokenKind::Comma {
+                        self.pos += 1;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
                 let pname = if let TokenKind::Ident(n) = self.peek_kind() {
                     let n = n.clone();
                     self.pos += 1;
@@ -477,6 +538,7 @@ impl<'a> Parser<'a> {
             params,
             ret,
             body,
+            variadic,
         }))
     }
 
@@ -580,15 +642,30 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 ty = Type::Pointer(Box::new(ty));
             }
+            // 函数指针声明符 RET (*name)(...)
+            if let Some((name, fty)) = self.try_fnptr_declarator(&ty)? {
+                let init = if *self.peek_kind() == TokenKind::Assign {
+                    self.pos += 1;
+                    Some(self.parse_assign()?)
+                } else {
+                    None
+                };
+                decls.push(Stmt::Declare { name, ty: fty, init });
+                if *self.peek_kind() == TokenKind::Comma {
+                    self.pos += 1;
+                    continue;
+                } else {
+                    break;
+                }
+            }
             let name = self.expect_ident()?;
-            // 数组后缀 name[N] 或 name[]（长度由初始化列表推断）
-            let mut infer_size = false;
-            if *self.peek_kind() == TokenKind::LBracket {
+            // 数组后缀，可多维 name[N][M]…；最外层可空 name[]（长度由初始化列表推断）
+            let mut dims: Vec<Option<usize>> = Vec::new();
+            while *self.peek_kind() == TokenKind::LBracket {
                 self.pos += 1;
                 if *self.peek_kind() == TokenKind::RBracket {
-                    infer_size = true;
+                    dims.push(None); // 推断（仅最外层有意义）
                     self.pos += 1;
-                    ty = Type::Array(Box::new(ty), 0); // 占位，解析初始化列表后修正
                 } else {
                     let n = match self.peek_kind() {
                         TokenKind::IntLit(v) => *v as usize,
@@ -601,8 +678,13 @@ impl<'a> Parser<'a> {
                     };
                     self.pos += 1;
                     self.expect(&TokenKind::RBracket)?;
-                    ty = Type::Array(Box::new(ty), n);
+                    dims.push(Some(n));
                 }
+            }
+            let infer_size = dims.first().map(|d| d.is_none()).unwrap_or(false);
+            // 由内向外嵌套：a[3][4] → Array(Array(elem,4),3)
+            for dim in dims.iter().rev() {
+                ty = Type::Array(Box::new(ty), dim.unwrap_or(0));
             }
             let init = if *self.peek_kind() == TokenKind::Assign {
                 self.pos += 1;
@@ -978,6 +1060,24 @@ impl<'a> Parser<'a> {
         let mut e = self.parse_primary()?;
         loop {
             match self.peek_kind() {
+                // 对任意表达式的调用 `expr(args)` → 经函数指针的间接调用（如 (*f)(x)）
+                TokenKind::LParen => {
+                    self.pos += 1;
+                    let mut args = Vec::new();
+                    while *self.peek_kind() != TokenKind::RParen {
+                        args.push(self.parse_assign()?);
+                        if *self.peek_kind() == TokenKind::Comma {
+                            self.pos += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                    e = Expr::CallPtr {
+                        func: Box::new(e),
+                        args,
+                    };
+                }
                 TokenKind::LBracket => {
                     self.pos += 1;
                     let index = self.parse_expr()?;
@@ -1042,6 +1142,43 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                 }
                 Ok(Expr::StrLit(s))
+            }
+            TokenKind::Ident(name)
+                if matches!(name.as_str(), "va_start" | "va_arg" | "va_end")
+                    && self.tokens.get(self.pos + 1).map(|t| &t.kind)
+                        == Some(&TokenKind::LParen) =>
+            {
+                let which = name.clone();
+                self.pos += 1; // 名字
+                self.expect(&TokenKind::LParen)?;
+                let ap = self.parse_assign()?; // va_list 变量
+                let expr = match which.as_str() {
+                    "va_arg" => {
+                        self.expect(&TokenKind::Comma)?;
+                        let ty = self.parse_type_specifier().ok_or_else(|| {
+                            CompileError::new(
+                                self.tokens[self.pos].span,
+                                "expected type in va_arg".to_string(),
+                            )
+                        })?;
+                        Expr::VaArg {
+                            ap: Box::new(ap),
+                            ty,
+                        }
+                    }
+                    "va_start" => {
+                        // 第二个参数（最后一个具名形参）解析后丢弃
+                        if *self.peek_kind() == TokenKind::Comma {
+                            self.pos += 1;
+                            let _ = self.parse_assign()?;
+                        }
+                        Expr::VaStart { ap: Box::new(ap) }
+                    }
+                    // va_end(ap)：无操作，求值为 0
+                    _ => Expr::IntLit(0),
+                };
+                self.expect(&TokenKind::RParen)?;
+                Ok(expr)
             }
             TokenKind::Ident(name) => {
                 let name = name.clone();
