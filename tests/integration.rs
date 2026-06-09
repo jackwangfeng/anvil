@@ -1208,3 +1208,93 @@ fn m24_char_cross_check() {
         "m24_char_cc",
     );
 }
+
+// ---- M25: 扩展 libc 系统头 + extern 全局(stdin/stdout/stderr) + 错误健壮性 ----
+
+#[test]
+fn m25_stdio_fprintf_stdout() {
+    // extern FILE* stdout 应解析到 libc 符号
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ fprintf(stdout, \"x=%d\\n\", 42); return 0; }",
+        "m25_fprintf",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "x=42\n");
+}
+
+#[test]
+fn m25_ctype_and_limits() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\n#include <ctype.h>\n#include <limits.h>\n\
+         int main(){ printf(\"%c %d %d\\n\", toupper('a'), isdigit('7')!=0, INT_MAX); return 0; }",
+        "m25_ctype",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "A 1 2147483647\n");
+}
+
+#[test]
+fn m25_stdbool_and_stddef() {
+    let (code, out) = compile_run_capture(
+        "#include <stdbool.h>\n#include <stddef.h>\n#include <stdio.h>\n\
+         int main(){ bool t=true; bool f=false; size_t n=5; void* p=NULL; \
+         printf(\"%d %d %lu %d\\n\", t, f, n, p==NULL); return 0; }",
+        "m25_bool",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "1 0 5 1\n");
+}
+
+#[test]
+fn m25_string_and_stdlib() {
+    let (code, out) = compile_run_capture(
+        "#include <string.h>\n#include <stdlib.h>\n#include <stdio.h>\n\
+         int main(){ char* b=malloc(16); strcpy(b, \"hi\"); strcat(b, \"!\"); \
+         printf(\"%s %lu %d\\n\", b, strlen(b), abs(-7)); free(b); return 0; }",
+        "m25_str",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "hi! 3 7\n");
+}
+
+#[test]
+fn m25_header_guards_idempotent() {
+    // 重复包含同一系统头(守卫)不应重复定义 size_t/NULL 而报错
+    let (code, _) = compile_run_capture(
+        "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\nint main(){ return 0; }",
+        "m25_guard",
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn m25_cross_check_headers() {
+    cross_check(
+        "#include <stdio.h>\n#include <string.h>\n#include <ctype.h>\n\
+         int main(){ char b[8]; strcpy(b,\"Abc\"); int s=0; \
+         for(int i=0;i<(int)strlen(b);i++) s+=toupper(b[i]); \
+         fprintf(stdout, \"%d\\n\", s); return 0; }",
+        "m25_cc",
+    );
+}
+
+#[test]
+fn m25_undeclared_variable_is_graceful_error() {
+    // 内部 panic(未声明变量)应降级为干净 error,退出码 1,无 backtrace
+    use std::process::Command;
+    let dir = std::env::temp_dir();
+    let c_path = dir.join("m25_bad.c");
+    std::fs::write(&c_path, "int main(){ return nope; }").expect("write");
+    let bin = env!("CARGO_BIN_EXE_anvil");
+    let out = Command::new(bin)
+        .arg(&c_path)
+        .arg("-o")
+        .arg(dir.join("m25_bad_out"))
+        .output()
+        .expect("run anvil");
+    assert!(!out.status.success(), "应编译失败");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error:"), "应有 error: 诊断: {}", stderr);
+    assert!(!stderr.contains("panicked"), "不应泄漏 panic backtrace: {}", stderr);
+    assert!(stderr.contains("nope"), "应指出未声明的名字: {}", stderr);
+}

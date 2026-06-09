@@ -14,6 +14,8 @@ pub struct Global {
     pub ty: Type,
     /// 初始化器(常量表达式或聚合初始化列表);None 表示零初始化。
     pub init: Option<Expr>,
+    /// `extern` 声明:仅引用外部符号,不生成存储(由链接器解析,如 stdin/stdout/stderr)。
+    pub is_extern: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

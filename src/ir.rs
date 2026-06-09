@@ -19,6 +19,8 @@ pub struct GlobalVar {
     pub size: usize,
     /// 初始化字节镜像(小端);None 表示零初始化。
     pub init: Option<Vec<u8>>,
+    /// `extern`:仅引用外部符号。原生后端不生成存储;LLVM 后端发 `external global`。
+    pub is_extern: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +222,7 @@ pub fn lower(ast: &AstProgram) -> Program {
                     .init
                     .as_ref()
                     .map(|e| eval_init_bytes(&g.ty, e, &ast.aggregates, size)),
+                is_extern: g.is_extern,
             }
         })
         .collect();
