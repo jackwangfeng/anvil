@@ -55,6 +55,54 @@ fn main() {
         return;
     }
 
+    // LLVM 目标:写 .ll → llc -O2 → .s → gcc 链接。
+    if opts.target == Target::Llvm {
+        let ll_path = format!("{}.ll", opts.output);
+        let s_path = format!("{}.s", opts.output);
+        if let Err(e) = std::fs::write(&ll_path, &asm) {
+            eprintln!("error: cannot write '{}': {}", ll_path, e);
+            exit(1);
+        }
+        let llc = Command::new("llc")
+            .args(["-O2", "-relocation-model=pic"])
+            .arg(&ll_path)
+            .arg("-o")
+            .arg(&s_path)
+            .status();
+        match llc {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!("error: llc failed: {}", s);
+                exit(1);
+            }
+            Err(e) => {
+                eprintln!("error: failed to invoke llc: {}", e);
+                exit(1);
+            }
+        }
+        let gcc = Command::new("gcc")
+            .arg(&s_path)
+            .arg("-no-pie")
+            .arg("-o")
+            .arg(&opts.output)
+            .status();
+        match gcc {
+            Ok(s) if s.success() => {
+                let _ = std::fs::remove_file(&ll_path);
+                let _ = std::fs::remove_file(&s_path);
+            }
+            Ok(s) => {
+                eprintln!("error: gcc failed: {}", s);
+                exit(1);
+            }
+            Err(e) => {
+                eprintln!("error: failed to invoke gcc: {}", e);
+                exit(1);
+            }
+        }
+        return;
+    }
+
     let asm_path = format!("{}.s", opts.output);
     if let Err(e) = std::fs::write(&asm_path, &asm) {
         eprintln!("error: cannot write '{}': {}", asm_path, e);
@@ -65,6 +113,7 @@ fn main() {
     let (assembler, extra): (&str, &[&str]) = match opts.target {
         Target::X86_64 => ("gcc", &["-no-pie"]),
         Target::Arm64 => ("clang", &[]),
+        Target::Llvm => unreachable!(),
     };
     let status = Command::new(assembler)
         .arg(&asm_path)
@@ -109,9 +158,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 target = match args.get(i).map(|s| s.as_str()) {
                     Some("arm64") | Some("aarch64") => Target::Arm64,
                     Some("x86_64") | Some("x86-64") | Some("amd64") => Target::X86_64,
+                    Some("llvm") => Target::Llvm,
                     other => {
                         return Err(format!(
-                            "error: --target expects arm64|x86_64, got {:?}",
+                            "error: --target expects arm64|x86_64|llvm, got {:?}",
                             other
                         ))
                     }
@@ -121,6 +171,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 target = match &other["--target=".len()..] {
                     "arm64" | "aarch64" => Target::Arm64,
                     "x86_64" | "x86-64" | "amd64" => Target::X86_64,
+                    "llvm" => Target::Llvm,
                     t => return Err(format!("error: unknown target '{}'", t)),
                 };
             }
