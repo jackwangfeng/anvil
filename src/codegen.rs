@@ -657,6 +657,14 @@ mod tests {
     }
 
     #[test]
+    fn arm64_do_while_body_before_cond() {
+        // do-while：循环体在条件判断之前（body 紧跟入口标签，cond 在体之后）
+        let asm = asm_arm64("int main(){ int i = 0; do { i++; } while (i < 3); return i; }");
+        // 含一个条件分支(cbz)用于退出循环
+        assert!(asm.contains("cbz w9,"));
+    }
+
+    #[test]
     fn arm64_long_arith_uses_64bit_ops() {
         let asm = asm_arm64("long f(long a, long b){ return a * b; } int main(){ return 0; }");
         assert!(asm.contains("mul x9, x9, x10")); // 64 位乘

@@ -73,6 +73,7 @@ pub enum TokenKind {
     KwSwitch,
     KwCase,
     KwDefault,
+    KwDo,
     Eof,
 }
 

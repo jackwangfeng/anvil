@@ -369,6 +369,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     "if" => TokenKind::KwIf,
                     "else" => TokenKind::KwElse,
                     "while" => TokenKind::KwWhile,
+                    "do" => TokenKind::KwDo,
                     "for" => TokenKind::KwFor,
                     "char" => TokenKind::KwChar,
                     "sizeof" => TokenKind::KwSizeof,

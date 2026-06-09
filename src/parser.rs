@@ -414,6 +414,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwReturn => return self.parse_return(),
             TokenKind::KwIf => return self.parse_if(),
             TokenKind::KwWhile => return self.parse_while(),
+            TokenKind::KwDo => return self.parse_do(),
             TokenKind::KwFor => return self.parse_for(),
             TokenKind::KwSwitch => return self.parse_switch(),
             TokenKind::LBrace => return self.parse_block(),
@@ -455,7 +456,7 @@ impl<'a> Parser<'a> {
         if self.at_type_start() {
             return self.parse_declaration();
         }
-        let e = self.parse_expr()?;
+        let e = self.parse_comma()?;
         self.expect(&TokenKind::Semicolon)?;
         Ok(Stmt::ExprStmt(e))
     }
@@ -476,7 +477,7 @@ impl<'a> Parser<'a> {
 
     fn parse_return(&mut self) -> Result<Stmt, CompileError> {
         self.expect(&TokenKind::KwReturn)?;
-        let expr = self.parse_expr()?;
+        let expr = self.parse_comma()?;
         self.expect(&TokenKind::Semicolon)?;
         Ok(Stmt::Return(expr))
     }
@@ -550,6 +551,17 @@ impl<'a> Parser<'a> {
         Ok(Stmt::While { cond, body })
     }
 
+    fn parse_do(&mut self) -> Result<Stmt, CompileError> {
+        self.expect(&TokenKind::KwDo)?;
+        let body = Box::new(self.parse_stmt()?);
+        self.expect(&TokenKind::KwWhile)?;
+        self.expect(&TokenKind::LParen)?;
+        let cond = self.parse_comma()?;
+        self.expect(&TokenKind::RParen)?;
+        self.expect(&TokenKind::Semicolon)?;
+        Ok(Stmt::DoWhile { body, cond })
+    }
+
     fn parse_for(&mut self) -> Result<Stmt, CompileError> {
         self.expect(&TokenKind::KwFor)?;
         self.expect(&TokenKind::LParen)?;
@@ -559,20 +571,20 @@ impl<'a> Parser<'a> {
         } else if self.at_type_start() {
             Some(Box::new(self.parse_declaration()?)) // 自带分号消费
         } else {
-            let e = self.parse_expr()?;
+            let e = self.parse_comma()?;
             self.expect(&TokenKind::Semicolon)?;
             Some(Box::new(Stmt::ExprStmt(e)))
         };
         let cond = if *self.peek_kind() == TokenKind::Semicolon {
             None
         } else {
-            Some(self.parse_expr()?)
+            Some(self.parse_comma()?)
         };
         self.expect(&TokenKind::Semicolon)?;
         let step = if *self.peek_kind() == TokenKind::RParen {
             None
         } else {
-            Some(self.parse_expr()?)
+            Some(self.parse_comma()?)
         };
         self.expect(&TokenKind::RParen)?;
         let body = Box::new(self.parse_stmt()?);
@@ -584,8 +596,23 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// 赋值级表达式（不含逗号运算符）——用于实参、初始化器、下标等以逗号分隔的语境。
     fn parse_expr(&mut self) -> Result<Expr, CompileError> {
         self.parse_assign()
+    }
+
+    /// 完整表达式，含逗号运算符（最低优先级）——用于表达式语句、return、for 子句、括号内。
+    fn parse_comma(&mut self) -> Result<Expr, CompileError> {
+        let mut e = self.parse_assign()?;
+        while *self.peek_kind() == TokenKind::Comma {
+            self.pos += 1;
+            let rhs = self.parse_assign()?;
+            e = Expr::Comma {
+                first: Box::new(e),
+                second: Box::new(rhs),
+            };
+        }
+        Ok(e)
     }
 
     fn parse_assign(&mut self) -> Result<Expr, CompileError> {
@@ -887,7 +914,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LParen => {
                 self.pos += 1;
-                let e = self.parse_expr()?;
+                let e = self.parse_comma()?;
                 self.expect(&TokenKind::RParen)?;
                 Ok(e)
             }

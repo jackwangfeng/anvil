@@ -43,6 +43,10 @@ pub enum Stmt {
         cond: Expr,
         body: Box<Stmt>,
     },
+    DoWhile {
+        body: Box<Stmt>,
+        cond: Expr,
+    },
     For {
         init: Option<Box<Stmt>>,
         cond: Option<Expr>,
@@ -101,6 +105,11 @@ pub enum Expr {
     Cast {
         ty: Type,
         expr: Box<Expr>,
+    },
+    /// 逗号运算符 `first, second`：求值 first（丢弃），结果为 second。
+    Comma {
+        first: Box<Expr>,
+        second: Box<Expr>,
     },
     Unary {
         op: UnaryOp,

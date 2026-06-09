@@ -424,6 +424,24 @@ impl<'a> Lowerer<'a> {
                 self.body.push(Instr::Jump(start));
                 self.body.push(Instr::Label(end));
             }
+            Stmt::DoWhile { body, cond } => {
+                // 先执行 body，再判断条件；continue 跳到条件判断，break 跳到结尾
+                let start = self.new_label();
+                let cont = self.new_label();
+                let end = self.new_label();
+                self.body.push(Instr::Label(start));
+                self.break_targets.push(end);
+                self.continue_targets.push(cont);
+                self.lower_stmt(body);
+                self.break_targets.pop();
+                self.continue_targets.pop();
+                self.body.push(Instr::Label(cont));
+                let (c, _) = self.lower_expr(cond);
+                // 条件为假则退出，否则回到 start
+                self.body.push(Instr::JumpIfZero { cond: c, target: end });
+                self.body.push(Instr::Jump(start));
+                self.body.push(Instr::Label(end));
+            }
             Stmt::For {
                 init,
                 cond,
@@ -633,6 +651,11 @@ impl<'a> Lowerer<'a> {
                 let (v, vty) = self.lower_expr(expr);
                 let r = self.coerce(v, &vty, ty);
                 (r, ty.clone())
+            }
+            Expr::Comma { first, second } => {
+                // 求值 first（仅副作用，丢弃结果），整体取 second 的值与类型
+                let _ = self.lower_expr(first);
+                self.lower_expr(second)
             }
             Expr::Unary { op, operand } => {
                 let (src, ty) = self.lower_expr(operand);
@@ -981,6 +1004,7 @@ impl<'a> Lowerer<'a> {
                     .unwrap_or(Type::Int)
             }
             Expr::Assign { value, .. } => self.type_of(value),
+            Expr::Comma { second, .. } => self.type_of(second),
         }
     }
 

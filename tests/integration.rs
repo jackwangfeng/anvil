@@ -693,3 +693,39 @@ fn m13_cast_int_to_long_widens() {
     assert_eq!(code, 0);
     assert_eq!(out, "10000000000\n");
 }
+
+// ---- M14: do-while 循环 + 逗号运算符 ----
+
+#[test]
+fn m14_do_while_basic() {
+    // do 体至少执行一次，再判条件：0+1+2+3+4 = 10
+    let src = "int main(){ int i = 0; int sum = 0; do { sum = sum + i; i++; } while (i < 5); return sum; }";
+    assert_eq!(compile_and_run(src, "m14_dw"), 10);
+}
+
+#[test]
+fn m14_do_while_runs_once_when_false() {
+    // 条件起始即假，do 体仍执行一次
+    let src = "int main(){ int n = 0; do { n++; } while (0); return n; }";
+    assert_eq!(compile_and_run(src, "m14_dw_once"), 1);
+}
+
+#[test]
+fn m14_do_while_break_continue() {
+    let src = "int main(){ int k = 0; do { k++; if (k == 3) break; } while (k < 100); return k; }";
+    assert_eq!(compile_and_run(src, "m14_dw_bc"), 3);
+}
+
+#[test]
+fn m14_comma_operator_value() {
+    // (b = 3, b * 2) 求值为 6
+    let src = "int main(){ int b; int a = (b = 3, b * 2); return a; }";
+    assert_eq!(compile_and_run(src, "m14_comma"), 6);
+}
+
+#[test]
+fn m14_comma_in_for_clauses() {
+    // for 的 init/step 用逗号运算符同时推进两个变量，相遇于 5
+    let src = "int main(){ int i; int j; int n = 0; for (i = 0, j = 10; i < j; i++, j--) n++; return n; }";
+    assert_eq!(compile_and_run(src, "m14_comma_for"), 5);
+}
