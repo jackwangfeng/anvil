@@ -1,6 +1,7 @@
 // 各阶段模块将在后续 Task 中加入。
 pub mod ast;
 pub mod codegen;
+pub mod codegen_llvm;
 pub mod codegen_x86;
 pub mod error;
 pub mod ir;
@@ -20,6 +21,8 @@ pub enum Target {
     Arm64,
     /// x86-64 / ELF（System V，Linux）。
     X86_64,
+    /// LLVM IR（.ll）；交由 llc/clang -O2 优化与生成机器码。
+    Llvm,
 }
 
 /// 编译 anvil 这个二进制时所在的宿主架构，决定默认目标。
@@ -41,10 +44,12 @@ pub fn compile_to_asm_target(src: &str, target: Target) -> Result<String, Compil
     let tokens = lexer::lex(src)?;
     let ast = parser::parse(&tokens)?;
     let ir = ir::lower(&ast);
-    Ok(match target {
-        Target::Arm64 => codegen::generate(&ir),
-        Target::X86_64 => codegen_x86::generate(&ir),
-    })
+    match target {
+        Target::Arm64 => Ok(codegen::generate(&ir)),
+        Target::X86_64 => Ok(codegen_x86::generate(&ir)),
+        Target::Llvm => codegen_llvm::generate(&ir)
+            .map_err(|m| CompileError::new(crate::span::Span::new(0, 0), m)),
+    }
 }
 
 #[cfg(test)]

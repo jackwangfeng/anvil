@@ -994,3 +994,69 @@ fn m19_variadic_double() {
     assert_eq!(code, 0);
     assert_eq!(out, "2.500000\n");
 }
+
+// ---- M21: LLVM 后端(--target llvm)与原生后端结果对拍 ----
+
+/// 用指定 target 编译并运行，返回 (退出码, stdout)。
+fn compile_run_target(src: &str, name: &str, target: &str) -> (i32, String) {
+    let dir = std::env::temp_dir();
+    let c_path = dir.join(format!("{}.c", name));
+    let exe_path = dir.join(name);
+    std::fs::write(&c_path, src).expect("write .c");
+    let bin = env!("CARGO_BIN_EXE_anvil");
+    let compile = Command::new(bin)
+        .arg(&c_path)
+        .args(["--target", target])
+        .arg("-o")
+        .arg(&exe_path)
+        .status()
+        .expect("run anvil");
+    assert!(compile.success(), "anvil --target {} failed for {}", target, name);
+    let out = Command::new(&exe_path).output().expect("run exe");
+    (out.status.code().expect("signal"), String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// 同一程序经原生 x86-64 后端与 LLVM 后端应产生完全一致的结果。
+fn cross_check(src: &str, name: &str) {
+    let native = compile_run_target(src, &format!("{}_n", name), "x86_64");
+    let llvm = compile_run_target(src, &format!("{}_l", name), "llvm");
+    assert_eq!(native, llvm, "native vs llvm 不一致 ({})", name);
+}
+
+#[test]
+fn m21_llvm_arithmetic_and_recursion() {
+    cross_check(
+        "int fib(int n){ return n<2?n:fib(n-1)+fib(n-2); } int main(){ int s=0; for(int i=0;i<12;i++) s+=fib(i); return s; }",
+        "m21_fib",
+    );
+}
+
+#[test]
+fn m21_llvm_pointers_and_arrays() {
+    cross_check(
+        "int main(){ int a[6]; for(int i=0;i<6;i++) a[i]=i*i; int*p=a; int*e=a+6; int s=0; while(p<e){ s+=*p; p++; } return s; }",
+        "m21_ptr",
+    );
+}
+
+#[test]
+fn m21_llvm_struct_and_long() {
+    cross_check(
+        "struct P{int x;int y;}; int main(){ struct P p; p.x=40; p.y=2; long b=100000; long sq=b*b; return p.x+p.y + (int)(sq/100000); }",
+        "m21_struct",
+    );
+}
+
+#[test]
+fn m21_llvm_double_and_printf() {
+    let src = "#include <stdio.h>\ndouble half(int x){ return x/2.0; } int main(){ printf(\"%d %f\\n\", 7, half(9)); return 0; }";
+    cross_check(src, "m21_dbl");
+}
+
+#[test]
+fn m21_llvm_control_flow() {
+    cross_check(
+        "int main(){ int s=0; for(int i=1;i<=100;i++){ if(i%3==0) continue; if(i>50) break; s+=i; } return s % 200; }",
+        "m21_cf",
+    );
+}
