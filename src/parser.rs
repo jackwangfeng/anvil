@@ -229,11 +229,12 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// 消费一段整型说明符关键字组合，归一为 Char / Long / Int。
-    /// `unsigned`/`signed` 不区分符号性(无符号语义未实现)，`short` 视作 int(无 16 位)。
+    /// 消费一段整型说明符关键字组合，归一为(有/无符号的) Char / Long / Int。
+    /// `short` 视作 int(无 16 位);`unsigned` 产出无符号变体。
     fn parse_integer_type(&mut self) -> Type {
         let mut is_char = false;
         let mut long_count = 0;
+        let mut uns = false;
         loop {
             match self.peek_kind() {
                 TokenKind::KwChar => {
@@ -244,19 +245,30 @@ impl<'a> Parser<'a> {
                     long_count += 1;
                     self.pos += 1;
                 }
-                TokenKind::KwInt
-                | TokenKind::KwShort
-                | TokenKind::KwUnsigned
-                | TokenKind::KwSigned => {
+                TokenKind::KwUnsigned => {
+                    uns = true;
+                    self.pos += 1;
+                }
+                TokenKind::KwInt | TokenKind::KwShort | TokenKind::KwSigned => {
                     self.pos += 1;
                 }
                 _ => break,
             }
         }
         if is_char {
-            Type::Char
+            if uns {
+                Type::UChar
+            } else {
+                Type::Char
+            }
         } else if long_count >= 1 {
-            Type::Long
+            if uns {
+                Type::ULong
+            } else {
+                Type::Long
+            }
+        } else if uns {
+            Type::UInt
         } else {
             Type::Int
         }
@@ -403,37 +415,48 @@ impl<'a> Parser<'a> {
         Some(ty)
     }
 
-    /// 注册一个全局变量声明符（数组后缀 + 可选整数常量初始化；不消费分号）。
+    /// 注册一个全局变量声明符（多维数组后缀 + 可选初始化器,含聚合 `{...}`；不消费分号）。
     fn parse_global_declarator(&mut self, mut ty: Type, name: String) -> Result<(), CompileError> {
-        if *self.peek_kind() == TokenKind::LBracket {
+        // 多维数组后缀,最外层可空(由初始化列表推断长度)
+        let mut dims: Vec<Option<usize>> = Vec::new();
+        while *self.peek_kind() == TokenKind::LBracket {
             self.pos += 1;
-            let n = match self.peek_kind() {
-                TokenKind::IntLit(v) => *v as usize,
-                _ => {
-                    return Err(CompileError::new(
-                        self.tokens[self.pos].span,
-                        "expected array size".to_string(),
-                    ))
-                }
-            };
-            self.pos += 1;
-            self.expect(&TokenKind::RBracket)?;
-            ty = Type::Array(Box::new(ty), n);
-        }
-        let mut init = None;
-        if *self.peek_kind() == TokenKind::Assign {
-            self.pos += 1;
-            let e = self.parse_expr()?;
-            match e {
-                Expr::IntLit(v) => init = Some(v),
-                _ => {
-                    return Err(CompileError::new(
-                        self.tokens[self.pos].span,
-                        "global initializer must be an integer constant".to_string(),
-                    ))
-                }
+            if *self.peek_kind() == TokenKind::RBracket {
+                dims.push(None);
+                self.pos += 1;
+            } else {
+                let n = match self.peek_kind() {
+                    TokenKind::IntLit(v) => *v as usize,
+                    _ => {
+                        return Err(CompileError::new(
+                            self.tokens[self.pos].span,
+                            "expected array size".to_string(),
+                        ))
+                    }
+                };
+                self.pos += 1;
+                self.expect(&TokenKind::RBracket)?;
+                dims.push(Some(n));
             }
         }
+        let infer = dims.first().map(|d| d.is_none()).unwrap_or(false);
+        for dim in dims.iter().rev() {
+            ty = Type::Array(Box::new(ty), dim.unwrap_or(0));
+        }
+        let init = if *self.peek_kind() == TokenKind::Assign {
+            self.pos += 1;
+            let e = self.parse_initializer()?;
+            if infer {
+                if let Expr::InitList(items) = &e {
+                    if let Type::Array(elem, _) = &ty {
+                        ty = Type::Array(elem.clone(), items.len());
+                    }
+                }
+            }
+            Some(e)
+        } else {
+            None
+        };
         self.global_types.insert(name.clone(), ty.clone());
         self.globals.push(Global { name, ty, init });
         Ok(())

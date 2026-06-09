@@ -6,6 +6,10 @@ pub enum Type {
     Int,
     Char,
     Long,
+    /// 无符号整型(运算时走无符号语义;布局与有符号同宽)。
+    UInt,
+    UChar,
+    ULong,
     Double,
     Pointer(Box<Type>),
     Array(Box<Type>, usize),
@@ -22,6 +26,9 @@ impl Type {
             Type::Int => 4,
             Type::Char => 1,
             Type::Long => 8,
+            Type::UInt => 4,
+            Type::UChar => 1,
+            Type::ULong => 8,
             Type::Double => 8,
             Type::Pointer(_) => 8,
             Type::FnPtr(_) => 8,
@@ -46,6 +53,11 @@ impl Type {
             Type::Pointer(t) | Type::Array(t, _) => Some(t),
             _ => None,
         }
+    }
+
+    /// 是否为无符号整型。
+    pub fn is_unsigned(&self) -> bool {
+        matches!(self, Type::UInt | Type::UChar | Type::ULong)
     }
 
     pub fn is_pointer_like(&self) -> bool {
