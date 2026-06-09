@@ -11,6 +11,8 @@ pub enum Type {
     Array(Box<Type>, usize),
     Struct(String),
     Union(String),
+    /// 函数指针，携带返回类型（参数按位置传递，类型不在此记录）。
+    FnPtr(Box<Type>),
 }
 
 impl Type {
@@ -22,6 +24,7 @@ impl Type {
             Type::Long => 8,
             Type::Double => 8,
             Type::Pointer(_) => 8,
+            Type::FnPtr(_) => 8,
             Type::Array(elem, n) => elem.size() * n,
             Type::Struct(_) | Type::Union(_) => {
                 unreachable!("use size_of with registry for aggregates")

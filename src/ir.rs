@@ -33,6 +33,8 @@ pub struct Function {
     pub ret_agg: Option<usize>,
     /// 返回大结构体（>16 字节）时，序言保存隐式返回指针的帧内槽位。
     pub sret_slot: Option<usize>,
+    /// 是否为可变参数函数（其可变参数由调用方压栈传入，va_list 线性遍历栈区）。
+    pub variadic: bool,
 }
 
 /// 一个形参在帧内的落点描述（目标无关）。各后端按自身 ABI 决定它来自哪个寄存器或栈位。
@@ -56,9 +58,17 @@ pub enum Instr {
     Label(usize),
     Jump(usize),
     JumpIfZero { cond: Temp, target: usize },
+    /// 取函数地址（函数名作为值/取址），得到函数指针。
+    FuncAddr { dst: Temp, name: String },
+    /// va_start：把 va_list（地址在 `ap`）置为首个可变参数的地址。
+    VaStart { ap: Temp },
+    /// va_arg：从 va_list（地址在 `ap`）取 `width` 字节到 `dst`，并把指针前进 8。
+    VaArg { dst: Temp, ap: Temp, width: usize },
     Call {
         dst: Temp,
         name: String,
+        /// 间接调用：通过该临时量中的函数指针调用（此时忽略 name）。直接调用为 None。
+        via: Option<Temp>,
         args: Vec<Temp>,
         /// 每个实参是否为浮点（double）——决定走 GP 还是 FP 寄存器。
         arg_floats: Vec<bool>,
@@ -71,6 +81,8 @@ pub enum Instr {
         ret_buf: Option<usize>,
         fixed: usize,
         variadic: bool,
+        /// 被调方是 anvil 自定义可变参数函数：可变实参（index ≥ fixed）一律压栈传递。
+        stack_varargs: bool,
         ret_float: bool,
     },
     ConstF {
@@ -127,8 +139,10 @@ pub enum Instr {
     MemCpy { dst: Temp, src: Temp, size: usize },
     LoadInd { dst: Temp, addr: Temp, width: usize, signed: bool },
     StoreInd { addr: Temp, src: Temp, width: usize },
-    PtrAdd { dst: Temp, base: Temp, index: Temp, shift: u32 },
-    PtrSub { dst: Temp, base: Temp, index: Temp, shift: u32 },
+    /// base + index * size（index 为 32 位有符号，按元素字节大小缩放）。
+    PtrAdd { dst: Temp, base: Temp, index: Temp, size: usize },
+    /// base - index * size。
+    PtrSub { dst: Temp, base: Temp, index: Temp, size: usize },
     /// `agg` 为 Some(size) 时按值返回结构体，`src` 存放结构体地址。
     Return { src: Temp, is_float: bool, width: usize, agg: Option<usize> },
 }
@@ -161,6 +175,9 @@ pub fn lower(ast: &AstProgram) -> Program {
         .iter()
         .map(|g| (g.name.clone(), g.ty.clone()))
         .collect();
+    // 有函数体的（用户自定义）函数名——用于区分自定义可变参数 vs libc（printf）。
+    let defined_funcs: std::collections::HashSet<String> =
+        ast.functions.iter().map(|f| f.name.clone()).collect();
     let functions = ast
         .functions
         .iter()
@@ -172,6 +189,7 @@ pub fn lower(ast: &AstProgram) -> Program {
                 &ast.aggregates,
                 &ast.signatures,
                 &global_types,
+                &defined_funcs,
             )
         })
         .collect();
@@ -207,6 +225,8 @@ struct Lowerer<'a> {
     continue_targets: Vec<usize>,
     /// 命名标签（goto/label）→ IR label 号；支持前向引用（先用后定义）。
     goto_labels: HashMap<String, usize>,
+    /// 有函数体的函数名集合（区分自定义可变参数与 libc 变参）。
+    defined_funcs: &'a std::collections::HashSet<String>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -403,6 +423,13 @@ impl<'a> Lowerer<'a> {
         } else {
             panic!("undeclared variable: {}", name);
         }
+    }
+
+    /// name 是否是一个函数（已声明签名且不是变量）。
+    fn is_function_name(&self, name: &str) -> bool {
+        self.lookup_var(name).is_none()
+            && !self.globals.contains_key(name)
+            && self.signatures.contains_key(name)
     }
 
     fn var_type(&self, name: &str) -> Option<Type> {
@@ -680,6 +707,17 @@ impl<'a> Lowerer<'a> {
                 self.body.push(Instr::StrLit { dst, index });
                 (dst, Type::Pointer(Box::new(Type::Char)))
             }
+            Expr::Var(name) if self.is_function_name(name) => {
+                // 函数名作为值 → 函数指针（取函数地址）
+                let dst = self.fresh();
+                self.body.push(Instr::FuncAddr { dst, name: name.clone() });
+                let ret = self
+                    .signatures
+                    .get(name)
+                    .map(|s| s.ret.clone())
+                    .unwrap_or(Type::Int);
+                (dst, Type::FnPtr(Box::new(ret)))
+            }
             Expr::Var(name) => {
                 let (addr, ty) = self.var_addr(name);
                 match ty {
@@ -699,11 +737,21 @@ impl<'a> Lowerer<'a> {
                 }
             }
             Expr::Addr(inner) => {
+                // &函数名 == 函数地址（函数指针）
+                if let Expr::Var(name) = inner.as_ref() {
+                    if self.is_function_name(name) {
+                        return self.lower_expr(inner);
+                    }
+                }
                 let (addr, ty) = self.lower_lvalue(inner);
                 (addr, Type::Pointer(Box::new(ty)))
             }
             Expr::Deref(inner) => {
                 let (ptr, ty) = self.lower_expr(inner);
+                // 解引用函数指针仍是函数（调用时再用），值不变
+                if matches!(ty, Type::FnPtr(_)) {
+                    return (ptr, ty);
+                }
                 let pointee = ty.decay().pointee().expect("deref of non-pointer").clone();
                 let dst = self.fresh();
                 let width = self.size_of(&pointee);
@@ -717,15 +765,21 @@ impl<'a> Lowerer<'a> {
             }
             Expr::Index { base, index } => {
                 let (ptr, pointee) = self.lower_index_addr(base, index);
-                let dst = self.fresh();
-                let width = self.size_of(&pointee);
-                self.body.push(Instr::LoadInd {
-                    dst,
-                    addr: ptr,
-                    width,
-                    signed: matches!(pointee, Type::Char),
-                });
-                (dst, pointee)
+                match pointee {
+                    // 聚合体元素（多维数组的子数组、结构体数组的元素）产出地址，不按标量载入
+                    Type::Array(..) | Type::Struct(_) | Type::Union(_) => (ptr, pointee),
+                    scalar => {
+                        let dst = self.fresh();
+                        let width = self.size_of(&scalar);
+                        self.body.push(Instr::LoadInd {
+                            dst,
+                            addr: ptr,
+                            width,
+                            signed: matches!(scalar, Type::Char),
+                        });
+                        (dst, scalar)
+                    }
+                }
             }
             Expr::Member { .. } => {
                 let (addr, ty) = self.lower_lvalue(e);
@@ -876,76 +930,134 @@ impl<'a> Lowerer<'a> {
                 (v, ty)
             }
             Expr::Call { name, args } => {
-                let sig = self.signatures.get(name).cloned();
-                let param_types: Vec<Type> =
-                    sig.as_ref().map(|s| s.params.clone()).unwrap_or_default();
-                let mut arg_temps: Vec<Temp> = Vec::with_capacity(args.len());
-                let mut arg_floats: Vec<bool> = Vec::with_capacity(args.len());
-                let mut arg_aggs: Vec<Option<usize>> = Vec::with_capacity(args.len());
-                for (i, a) in args.iter().enumerate() {
-                    let (t0, ty0) = self.lower_expr(a);
-                    // 已知形参类型时，把实参按形参类型隐式转换（如 int → double）。
-                    let (t, ty) = match param_types.get(i) {
-                        Some(pt) => (self.coerce(t0, &ty0, pt), pt.clone()),
-                        None => (t0, ty0),
-                    };
-                    arg_temps.push(t);
-                    arg_floats.push(matches!(ty, Type::Double));
-                    arg_aggs.push(match ty {
-                        Type::Struct(_) | Type::Union(_) => Some(self.size_of(&ty)),
-                        _ => None,
-                    });
-                }
-                let ret = sig.as_ref().map(|s| s.ret.clone()).unwrap_or(Type::Int);
-                let ret_float = matches!(ret, Type::Double);
-                let ret_agg = match ret {
-                    Type::Struct(_) | Type::Union(_) => Some(self.size_of(&ret)),
-                    _ => None,
-                };
-                let ret_width = if matches!(ret, Type::Pointer(_) | Type::Double | Type::Long) {
-                    8
+                // 若 name 是函数指针变量 → 间接调用；否则按函数名直接调用。
+                if let Some(Type::FnPtr(ret)) = self.var_type(name) {
+                    let (fp, _) = self.lower_expr(&Expr::Var(name.clone()));
+                    self.emit_call(String::new(), Some(fp), *ret, args, &[], args.len(), false, false)
                 } else {
-                    4
-                };
-                let fixed = sig.as_ref().map(|s| s.fixed).unwrap_or(arg_temps.len());
-                let variadic = sig.as_ref().map(|s| s.variadic).unwrap_or(false);
-                if let Some(size) = ret_agg {
-                    // 结构体返回：分配缓冲区，Call 把结果写入，表达式求值为其地址。
-                    let buf = self.alloc_bytes(size);
-                    self.body.push(Instr::Call {
-                        dst: 0,
-                        name: name.clone(),
-                        args: arg_temps,
-                        arg_floats,
-                        arg_aggs,
-                        ret_width,
-                        ret_agg,
-                        ret_buf: Some(buf),
+                    let sig = self.signatures.get(name).cloned();
+                    let param_types: Vec<Type> =
+                        sig.as_ref().map(|s| s.params.clone()).unwrap_or_default();
+                    let ret = sig.as_ref().map(|s| s.ret.clone()).unwrap_or(Type::Int);
+                    let fixed = sig.as_ref().map(|s| s.fixed).unwrap_or(args.len());
+                    let variadic = sig.as_ref().map(|s| s.variadic).unwrap_or(false);
+                    // 自定义可变参数函数：可变实参压栈传递
+                    let stack_varargs = variadic && self.defined_funcs.contains(name);
+                    self.emit_call(
+                        name.clone(),
+                        None,
+                        ret,
+                        args,
+                        &param_types,
                         fixed,
                         variadic,
-                        ret_float,
-                    });
-                    let addr = self.fresh();
-                    self.body.push(Instr::AddrOf { dst: addr, off: buf });
-                    (addr, ret)
-                } else {
-                    let dst = self.fresh();
-                    self.body.push(Instr::Call {
-                        dst,
-                        name: name.clone(),
-                        args: arg_temps,
-                        arg_floats,
-                        arg_aggs,
-                        ret_width,
-                        ret_agg: None,
-                        ret_buf: None,
-                        fixed,
-                        variadic,
-                        ret_float,
-                    });
-                    (dst, ret)
+                        stack_varargs,
+                    )
                 }
             }
+            Expr::CallPtr { func, args } => {
+                let (fp, fty) = self.lower_expr(func);
+                let ret = match fty {
+                    Type::FnPtr(r) => *r,
+                    _ => Type::Int,
+                };
+                self.emit_call(String::new(), Some(fp), ret, args, &[], args.len(), false, false)
+            }
+            Expr::VaStart { ap } => {
+                let (ap_addr, _) = self.lower_lvalue(ap);
+                self.body.push(Instr::VaStart { ap: ap_addr });
+                let dst = self.fresh();
+                self.body.push(Instr::Const { dst, value: 0 });
+                (dst, Type::Int)
+            }
+            Expr::VaArg { ap, ty } => {
+                let (ap_addr, _) = self.lower_lvalue(ap);
+                let dst = self.fresh();
+                let width = self.size_of(ty);
+                self.body.push(Instr::VaArg { dst, ap: ap_addr, width });
+                (dst, ty.clone())
+            }
+        }
+    }
+
+    /// 发射一次调用（直接或经函数指针 `via`），处理实参分类、结构体返回缓冲区。
+    #[allow(clippy::too_many_arguments)]
+    fn emit_call(
+        &mut self,
+        name: String,
+        via: Option<Temp>,
+        ret: Type,
+        args: &[Expr],
+        param_types: &[Type],
+        fixed: usize,
+        variadic: bool,
+        stack_varargs: bool,
+    ) -> (Temp, Type) {
+        let mut arg_temps: Vec<Temp> = Vec::with_capacity(args.len());
+        let mut arg_floats: Vec<bool> = Vec::with_capacity(args.len());
+        let mut arg_aggs: Vec<Option<usize>> = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let (t0, ty0) = self.lower_expr(a);
+            let (t, ty) = match param_types.get(i) {
+                Some(pt) => (self.coerce(t0, &ty0, pt), pt.clone()),
+                None => (t0, ty0),
+            };
+            arg_temps.push(t);
+            arg_floats.push(matches!(ty, Type::Double));
+            arg_aggs.push(match ty {
+                Type::Struct(_) | Type::Union(_) => Some(self.size_of(&ty)),
+                _ => None,
+            });
+        }
+        let ret_float = matches!(ret, Type::Double);
+        let ret_agg = match ret {
+            Type::Struct(_) | Type::Union(_) => Some(self.size_of(&ret)),
+            _ => None,
+        };
+        let ret_width =
+            if matches!(ret, Type::Pointer(_) | Type::Double | Type::Long | Type::FnPtr(_)) {
+                8
+            } else {
+                4
+            };
+        if let Some(size) = ret_agg {
+            let buf = self.alloc_bytes(size);
+            self.body.push(Instr::Call {
+                dst: 0,
+                name,
+                via,
+                args: arg_temps,
+                arg_floats,
+                arg_aggs,
+                ret_width,
+                ret_agg,
+                ret_buf: Some(buf),
+                fixed,
+                variadic,
+                stack_varargs,
+                ret_float,
+            });
+            let addr = self.fresh();
+            self.body.push(Instr::AddrOf { dst: addr, off: buf });
+            (addr, ret)
+        } else {
+            let dst = self.fresh();
+            self.body.push(Instr::Call {
+                dst,
+                name,
+                via,
+                args: arg_temps,
+                arg_floats,
+                arg_aggs,
+                ret_width,
+                ret_agg: None,
+                ret_buf: None,
+                fixed,
+                variadic,
+                stack_varargs,
+                ret_float,
+            });
+            (dst, ret)
         }
     }
 
@@ -985,12 +1097,12 @@ impl<'a> Lowerer<'a> {
         let elem = pty.decay().pointee().expect("index of non-pointer").clone();
         let (idx, _) = self.lower_expr(index);
         let dst = self.fresh();
-        let shift = shift_of(self.size_of(&elem));
+        let size = self.size_of(&elem);
         self.body.push(Instr::PtrAdd {
             dst,
             base: ptr,
             index: idx,
-            shift,
+            size,
         });
         (dst, elem)
     }
@@ -1008,20 +1120,20 @@ impl<'a> Lowerer<'a> {
             };
             let elem = pty.decay().pointee().unwrap().clone();
             let dst = self.fresh();
-            let shift = shift_of(self.size_of(&elem));
+            let size = self.size_of(&elem);
             if op == BinaryOp::Add {
                 self.body.push(Instr::PtrAdd {
                     dst,
                     base: ptr,
                     index: idx,
-                    shift,
+                    size,
                 });
             } else {
                 self.body.push(Instr::PtrSub {
                     dst,
                     base: ptr,
                     index: idx,
-                    shift,
+                    size,
                 });
             }
             return (dst, pty.decay());
@@ -1156,6 +1268,12 @@ impl<'a> Lowerer<'a> {
             Expr::Assign { value, .. } => self.type_of(value),
             Expr::Comma { second, .. } => self.type_of(second),
             Expr::InitList(items) => items.first().map(|e| self.type_of(e)).unwrap_or(Type::Int),
+            Expr::CallPtr { func, .. } => match self.type_of(func) {
+                Type::FnPtr(r) => *r,
+                _ => Type::Int,
+            },
+            Expr::VaStart { .. } => Type::Int,
+            Expr::VaArg { ty, .. } => ty.clone(),
         }
     }
 
@@ -1205,7 +1323,7 @@ enum NumKind {
 fn num_kind(ty: &Type) -> NumKind {
     match ty {
         Type::Int | Type::Char => NumKind::Narrow,
-        Type::Long | Type::Pointer(_) | Type::Array(..) => NumKind::Wide,
+        Type::Long | Type::Pointer(_) | Type::Array(..) | Type::FnPtr(_) => NumKind::Wide,
         Type::Double => NumKind::Float,
         _ => NumKind::Other,
     }
@@ -1257,15 +1375,6 @@ fn lower_binop(op: BinaryOp) -> BinOp {
     }
 }
 
-/// 元素大小（2 的幂）→ 移位量；其它退化为 0（字节寻址）。
-fn shift_of(size: usize) -> u32 {
-    match size {
-        2 => 1,
-        4 => 2,
-        8 => 3,
-        _ => 0,
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 fn lower_func(
@@ -1275,6 +1384,7 @@ fn lower_func(
     aggregates: &Aggregates,
     signatures: &Signatures,
     globals: &HashMap<String, Type>,
+    defined_funcs: &std::collections::HashSet<String>,
 ) -> Function {
     let mut lw = Lowerer {
         body: Vec::new(),
@@ -1290,6 +1400,7 @@ fn lower_func(
         break_targets: Vec::new(),
         continue_targets: Vec::new(),
         goto_labels: HashMap::new(),
+        defined_funcs,
     };
     let ret_agg = match f.ret {
         Type::Struct(_) | Type::Union(_) => Some(lw.size_of(&f.ret)),
@@ -1323,6 +1434,7 @@ fn lower_func(
         ret_float: matches!(f.ret, Type::Double),
         ret_agg,
         sret_slot,
+        variadic: f.variadic,
     }
 }
 
@@ -1487,7 +1599,7 @@ mod tests {
     #[test]
     fn lower_index_uses_ptradd() {
         let f = lower_src("int main(){ int a[4]; return a[2]; }");
-        assert!(f.body.iter().any(|i| matches!(i, Instr::PtrAdd { shift: 2, .. })));
+        assert!(f.body.iter().any(|i| matches!(i, Instr::PtrAdd { size: 4, .. })));
     }
 
     #[test]
