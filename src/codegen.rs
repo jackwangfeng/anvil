@@ -98,11 +98,12 @@ fn gen_floats(floats: &[u64], out: &mut String) {
 }
 
 fn gen_globals(globals: &[crate::ir::GlobalVar], out: &mut String) {
-    if globals.is_empty() {
+    // extern 全局仅引用外部符号,不生成存储(汇编器/链接器自行解析)。
+    if globals.iter().all(|g| g.is_extern) {
         return;
     }
     out.push_str(".section __DATA,__data\n");
-    for g in globals {
+    for g in globals.iter().filter(|g| !g.is_extern) {
         out.push_str(".globl _");
         out.push_str(&g.name);
         out.push('\n');

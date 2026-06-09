@@ -35,6 +35,11 @@ pub fn generate(program: &Program) -> Result<String, String> {
     }
     // 全局变量:统一用 [N x i8] 字节镜像
     for g in &program.globals {
+        if g.is_extern {
+            // extern:声明外部符号,由链接器解析(如 stdin/stdout/stderr)
+            let _ = writeln!(out, "@{} = external global [{} x i8]", g.name, g.size.max(1));
+            continue;
+        }
         match &g.init {
             Some(bytes) => {
                 let mut s = String::new();

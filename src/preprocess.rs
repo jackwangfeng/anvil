@@ -43,32 +43,78 @@ fn err(msg: impl Into<String>) -> CompileError {
 }
 
 /// 内置最小系统头：声明常用 libc 函数（提供返回类型与可变参数信息）。
-fn builtin_header(name: &str) -> Option<&'static str> {
-    match name {
-        "stdio.h" => Some(
-            "int printf(const char*, ...);\n\
-             int puts(const char*);\n\
-             int putchar(int);\n\
-             int getchar(void);\n\
-             int scanf(const char*, ...);\n",
+/// 公共定义(size_t / NULL / ptrdiff_t),带守卫防重复。
+const COMMON: &str = "#ifndef __ANVIL_COMMON\n#define __ANVIL_COMMON\n\
+    typedef unsigned long size_t;\ntypedef long ptrdiff_t;\n#define NULL 0\n#endif\n";
+
+/// 内置系统头:常用 libc 原型 + typedef + 宏(过预处理,支持 #define/守卫)。
+/// 函数由系统 libc 提供(链接时解析);size_t 用 unsigned long(调用时零扩展为干净 64 位)。
+fn builtin_header(name: &str) -> Option<String> {
+    let body = match name {
+        "stddef.h" => String::new(),
+        "stdbool.h" => "#define bool int\n#define true 1\n#define false 0\n".into(),
+        // va_list/va_start/va_arg/va_end 为编译器内建,无需声明
+        "stdarg.h" => String::new(),
+        "assert.h" => "void abort(void);\n#define assert(x) ((x) ? 0 : (abort(), 0))\n".into(),
+        "limits.h" => "#define CHAR_BIT 8\n#define INT_MAX 2147483647\n\
+            #define INT_MIN (-2147483647-1)\n#define UINT_MAX 4294967295\n\
+            #define CHAR_MAX 127\n#define CHAR_MIN (-128)\n#define UCHAR_MAX 255\n\
+            #define SHRT_MAX 32767\n#define SHRT_MIN (-32768)\n\
+            #define LONG_MAX 9223372036854775807\n#define LONG_MIN (-9223372036854775807-1)\n"
+            .into(),
+        "stdint.h" => "typedef char int8_t;\ntypedef unsigned char uint8_t;\n\
+            typedef short int16_t;\ntypedef unsigned short uint16_t;\n\
+            typedef int int32_t;\ntypedef unsigned int uint32_t;\n\
+            typedef long int64_t;\ntypedef unsigned long uint64_t;\n\
+            typedef long intptr_t;\ntypedef unsigned long uintptr_t;\n"
+            .into(),
+        "ctype.h" => "int isdigit(int);\nint isalpha(int);\nint isalnum(int);\n\
+            int isspace(int);\nint islower(int);\nint isupper(int);\nint ispunct(int);\n\
+            int isxdigit(int);\nint tolower(int);\nint toupper(int);\n"
+            .into(),
+        "math.h" => "double sqrt(double);\ndouble pow(double, double);\ndouble fabs(double);\n\
+            double floor(double);\ndouble ceil(double);\ndouble sin(double);\n\
+            double cos(double);\ndouble exp(double);\ndouble log(double);\n"
+            .into(),
+        "stdio.h" => format!(
+            "{COMMON}\
+             typedef struct __anvil_FILE FILE;\n#define EOF (-1)\n\
+             extern FILE* stdin;\nextern FILE* stdout;\nextern FILE* stderr;\n\
+             int printf(const char*, ...);\nint fprintf(FILE*, const char*, ...);\n\
+             int sprintf(char*, const char*, ...);\nint snprintf(char*, size_t, const char*, ...);\n\
+             int scanf(const char*, ...);\nint sscanf(const char*, const char*, ...);\n\
+             int puts(const char*);\nint fputs(const char*, FILE*);\n\
+             int putchar(int);\nint getchar(int);\nint fputc(int, FILE*);\nint fgetc(FILE*);\n\
+             FILE* fopen(const char*, const char*);\nint fclose(FILE*);\n\
+             char* fgets(char*, int, FILE*);\nsize_t fread(void*, size_t, size_t, FILE*);\n\
+             size_t fwrite(const void*, size_t, size_t, FILE*);\nint fflush(FILE*);\n\
+             void perror(const char*);\n"
         ),
-        "stdlib.h" => Some(
-            "void* malloc(int);\n\
-             void* calloc(int, int);\n\
-             void free(void*);\n\
-             int atoi(const char*);\n\
-             int abs(int);\n\
-             void exit(int);\n",
+        "stdlib.h" => format!(
+            "{COMMON}\
+             void* malloc(size_t);\nvoid* calloc(size_t, size_t);\n\
+             void* realloc(void*, size_t);\nvoid free(void*);\n\
+             int atoi(const char*);\nlong atol(const char*);\n\
+             long strtol(const char*, char**, int);\ndouble strtod(const char*, char**);\n\
+             int abs(int);\nlong labs(long);\nvoid exit(int);\nvoid abort(void);\n\
+             int rand(void);\nvoid srand(unsigned int);\nint system(const char*);\n\
+             char* getenv(const char*);\n\
+             void qsort(void*, size_t, size_t, int (*)(const void*, const void*));\n"
         ),
-        "string.h" => Some(
-            "int strlen(const char*);\n\
-             int strcmp(const char*, const char*);\n\
-             char* strcpy(char*, const char*);\n\
-             void* memcpy(void*, void*, int);\n\
-             void* memset(void*, int, int);\n",
+        "string.h" => format!(
+            "{COMMON}\
+             size_t strlen(const char*);\n\
+             int strcmp(const char*, const char*);\nint strncmp(const char*, const char*, size_t);\n\
+             char* strcpy(char*, const char*);\nchar* strncpy(char*, const char*, size_t);\n\
+             char* strcat(char*, const char*);\nchar* strncat(char*, const char*, size_t);\n\
+             char* strchr(const char*, int);\nchar* strrchr(const char*, int);\n\
+             char* strstr(const char*, const char*);\nchar* strdup(const char*);\n\
+             void* memcpy(void*, const void*, size_t);\nvoid* memmove(void*, const void*, size_t);\n\
+             void* memset(void*, int, size_t);\nint memcmp(const void*, const void*, size_t);\n"
         ),
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(body)
 }
 
 impl Preprocessor {
@@ -207,8 +253,15 @@ impl Preprocessor {
         let path = if let Some(inner) = a.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
             self.base_dir.join(inner)
         } else if let Some(inner) = a.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
-            // 系统头：提供内置最小原型集（声明常用 libc 函数）
-            return Ok(builtin_header(inner.trim()).unwrap_or("").to_string());
+            // 系统头：内置最小集（原型/typedef/宏）；同样过一遍预处理(支持 #define / 守卫)
+            let text = builtin_header(inner.trim()).unwrap_or_default();
+            if self.include_depth > 50 {
+                return Err(err("#include nested too deep"));
+            }
+            self.include_depth += 1;
+            let result = self.run(&text);
+            self.include_depth -= 1;
+            return result;
         } else {
             return Err(err(format!("bad #include: {}", a)));
         };

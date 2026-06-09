@@ -38,7 +38,7 @@ fn main() {
         }
     };
 
-    let asm = match compile_to_asm_target(&preprocessed, opts.target) {
+    let asm = match compile_guarded(&preprocessed, opts.target) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{}:{}", opts.input, e);
@@ -133,6 +133,30 @@ fn main() {
         Err(e) => {
             eprintln!("error: failed to invoke {}: {}", assembler, e);
             exit(1);
+        }
+    }
+}
+
+/// 编译并兜底捕获内部 panic（降级、代码生成阶段的未声明变量/非左值等），
+/// 转成干净的 `error:` 诊断，而不是向终端用户抛 Rust backtrace。
+fn compile_guarded(src: &str, target: Target) -> Result<String, String> {
+    // 临时静默 panic 默认输出（线程名/backtrace 提示），仅在本次编译期间。
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compile_to_asm_target(src, target)
+    }));
+    std::panic::set_hook(prev);
+    match result {
+        Ok(Ok(asm)) => Ok(asm),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "internal compiler error".to_string());
+            Err(format!("error: {}", msg))
         }
     }
 }

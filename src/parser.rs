@@ -15,6 +15,7 @@ pub fn parse(tokens: &[Token]) -> Result<Program, CompileError> {
         globals: Vec::new(),
         global_types: HashMap::new(),
         anon_counter: 0,
+        saw_extern: false,
     };
     p.parse_program()
 }
@@ -29,6 +30,8 @@ struct Parser<'a> {
     globals: Vec<Global>,
     global_types: HashMap<String, Type>,
     anon_counter: usize,
+    /// 最近一次 parse_base_type 是否见到 `extern`（用于抑制 extern 全局的定义生成）。
+    saw_extern: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -276,7 +279,8 @@ impl<'a> Parser<'a> {
 
     /// 基础类型说明符（不含指针 `*`）：int/char/long/short/unsigned/signed/double/void、struct|union、enum、typedef 名。
     fn parse_base_type(&mut self) -> Option<Type> {
-        // 跳过前导限定符 / 存储类（const、static、extern、register、auto；语义忽略）
+        // 跳过前导限定符 / 存储类（const、static、register、auto 语义忽略；extern 记下以抑制定义）
+        self.saw_extern = false;
         while matches!(
             self.peek_kind(),
             TokenKind::KwConst
@@ -285,6 +289,9 @@ impl<'a> Parser<'a> {
                 | TokenKind::KwRegister
                 | TokenKind::KwAuto
         ) {
+            if *self.peek_kind() == TokenKind::KwExtern {
+                self.saw_extern = true;
+            }
             self.pos += 1;
         }
         // 整型说明符组合（int/char/long/short/unsigned/signed 任意搭配）
@@ -458,7 +465,9 @@ impl<'a> Parser<'a> {
             None
         };
         self.global_types.insert(name.clone(), ty.clone());
-        self.globals.push(Global { name, ty, init });
+        // `extern`(无初始化器)只引用外部符号,不生成存储 —— 由链接器解析(如 stdin/stdout/stderr)。
+        let is_extern = self.saw_extern && init.is_none();
+        self.globals.push(Global { name, ty, init, is_extern });
         Ok(())
     }
 
