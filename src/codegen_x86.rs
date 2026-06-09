@@ -131,6 +131,9 @@ fn gen_func(func: &Function, out: &mut String) {
     for instr in &func.body {
         gen_instr(instr, &func.name, frame, func.sret_slot, va_base, out);
     }
+    // 兜底尾声:函数体未以 return 结束时避免坠落到下个函数(如无 return 的 void 函数)。
+    // 若上方已有 ret,这段是不可达死代码。
+    out.push_str("    movl $0, %eax\n    leave\n    ret\n");
 }
 
 /// 一个实参/形参在 System V 下的去向。
@@ -409,7 +412,7 @@ fn gen_instr(
             let _ = writeln!(out, "    movq {}, %rcx", m(*ap)); // rcx = &va_list
             out.push_str("    movq %rax, (%rcx)\n");
         }
-        Instr::VaArg { dst, ap, width } => {
+        Instr::VaArg { dst, ap, width, is_float: _ } => {
             let _ = writeln!(out, "    movq {}, %rcx", m(*ap)); // rcx = &va_list
             out.push_str("    movq (%rcx), %rdx\n"); // rdx = 当前遍历指针
             if *width == 8 {

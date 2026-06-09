@@ -1060,3 +1060,50 @@ fn m21_llvm_control_flow() {
         "m21_cf",
     );
 }
+
+#[test]
+fn m_void_fn_without_return_no_fallthrough() {
+    // 回归:无 return 的 void 函数不能坠落到下一个函数(曾导致 main 被重入)
+    let src = "void noop(){ int x = 1; } int main(){ noop(); return 42; }";
+    assert_eq!(compile_and_run(src, "void_noret"), 42);
+}
+
+#[test]
+fn m_void_fn_before_main_returns_cleanly() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nvoid greet(){ printf(\"hi\\n\"); } int main(){ greet(); greet(); return 0; }",
+        "void_before_main",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "hi\nhi\n"); // 恰好两次,不重入
+}
+
+#[test]
+fn m21_llvm_function_pointers() {
+    cross_check(
+        "int sq(int x){return x*x;} int cu(int x){return x*x*x;} int apply(int(*f)(int),int x){return f(x);} int main(){ int(*g)(int)=sq; int a=g(5); g=cu; return a + apply(g,3) + apply(sq,4); }",
+        "m21_fnptr",
+    );
+}
+
+#[test]
+fn m21_llvm_struct_by_value() {
+    cross_check(
+        "struct P{int x;int y;}; struct P mk(int a,int b){struct P p; p.x=a; p.y=b; return p;} int sum(struct P p){return p.x+p.y;} int main(){ struct P q=mk(40,2); return sum(q) + sum(mk(10,20)); }",
+        "m21_sbv",
+    );
+}
+
+#[test]
+fn m21_llvm_user_varargs() {
+    cross_check(
+        "int vsum(int n, ...){ va_list ap; va_start(ap,n); int s=0; for(int i=0;i<n;i++) s+=va_arg(ap,int); va_end(ap); return s; } int main(){ return vsum(6, 1,2,3,4,5,6); }",
+        "m21_va",
+    );
+}
+
+#[test]
+fn m21_llvm_varargs_double() {
+    let src = "#include <stdio.h>\ndouble favg(int n, ...){ va_list ap; va_start(ap,n); double s=0; for(int i=0;i<n;i++) s+=va_arg(ap,double); va_end(ap); return s/n; } int main(){ printf(\"%f\\n\", favg(4, 2.0,4.0,6.0,8.0)); return 0; }";
+    cross_check(src, "m21_va_d");
+}
