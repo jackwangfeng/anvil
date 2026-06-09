@@ -115,6 +115,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwInt
             | TokenKind::KwChar
             | TokenKind::KwDouble
+            | TokenKind::KwLong
             | TokenKind::KwVoid
             | TokenKind::KwConst
             | TokenKind::KwStruct
@@ -243,6 +244,14 @@ impl<'a> Parser<'a> {
             TokenKind::KwDouble => {
                 self.pos += 1;
                 Type::Double
+            }
+            TokenKind::KwLong => {
+                // long / long int / long long / long long int 均视作 64 位整数
+                self.pos += 1;
+                while matches!(self.peek_kind(), TokenKind::KwLong | TokenKind::KwInt) {
+                    self.pos += 1;
+                }
+                Type::Long
             }
             TokenKind::KwStruct | TokenKind::KwUnion => {
                 let save = self.pos;
@@ -683,8 +692,39 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
+    /// 当前在 `(`，其后是否为类型起始（用于区分强转 `(int)x` 与括号表达式 `(x)`）。
+    fn is_cast_ahead(&self) -> bool {
+        match self.tokens.get(self.pos + 1).map(|t| &t.kind) {
+            Some(
+                TokenKind::KwInt
+                | TokenKind::KwChar
+                | TokenKind::KwDouble
+                | TokenKind::KwLong
+                | TokenKind::KwVoid
+                | TokenKind::KwConst
+                | TokenKind::KwStruct
+                | TokenKind::KwUnion
+                | TokenKind::KwEnum,
+            ) => true,
+            Some(TokenKind::Ident(n)) => self.typedefs.contains_key(n),
+            _ => false,
+        }
+    }
+
     fn parse_unary(&mut self) -> Result<Expr, CompileError> {
         match self.peek_kind() {
+            TokenKind::LParen if self.is_cast_ahead() => {
+                self.pos += 1; // (
+                let ty = self.parse_type_specifier().ok_or_else(|| {
+                    CompileError::new(self.tokens[self.pos].span, "expected cast type".to_string())
+                })?;
+                self.expect(&TokenKind::RParen)?;
+                let operand = self.parse_unary()?;
+                Ok(Expr::Cast {
+                    ty,
+                    expr: Box::new(operand),
+                })
+            }
             TokenKind::Minus => {
                 self.pos += 1;
                 Ok(Expr::Unary {

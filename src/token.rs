@@ -67,6 +67,7 @@ pub enum TokenKind {
     KwVoid,
     KwConst,
     KwDouble,
+    KwLong,
     KwBreak,
     KwContinue,
     KwSwitch,

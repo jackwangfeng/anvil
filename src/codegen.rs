@@ -205,8 +205,14 @@ fn gen_strings(strings: &[String], out: &mut String) {
 fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, out: &mut String) {
     match instr {
         Instr::Const { dst, value } => {
-            materialize_const(*value, out);
-            let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
+            if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 {
+                materialize_const(*value, out);
+                let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
+            } else {
+                // 超 32 位字面量（long）：64 位物化，写满 8 字节
+                materialize_const64(*value, out);
+                let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+            }
         }
         Instr::Neg { dst, src } => {
             let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*src));
@@ -497,6 +503,59 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, 
             out.push_str("    fcvtzs w9, d0\n");
             let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
         }
+        Instr::BinL { dst, op, lhs, rhs } => {
+            // 64 位有符号整数运算
+            let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*lhs));
+            let _ = writeln!(out, "    ldr x10, [sp, #{}]", slot(*rhs));
+            match op {
+                BinOp::Add => out.push_str("    add x9, x9, x10\n"),
+                BinOp::Sub => out.push_str("    sub x9, x9, x10\n"),
+                BinOp::Mul => out.push_str("    mul x9, x9, x10\n"),
+                BinOp::Div => out.push_str("    sdiv x9, x9, x10\n"),
+                BinOp::Mod => {
+                    out.push_str("    sdiv x11, x9, x10\n");
+                    out.push_str("    msub x9, x11, x10, x9\n");
+                }
+                BinOp::Lt => out.push_str("    cmp x9, x10\n    cset w9, lt\n"),
+                BinOp::Gt => out.push_str("    cmp x9, x10\n    cset w9, gt\n"),
+                BinOp::Le => out.push_str("    cmp x9, x10\n    cset w9, le\n"),
+                BinOp::Ge => out.push_str("    cmp x9, x10\n    cset w9, ge\n"),
+                BinOp::Eq => out.push_str("    cmp x9, x10\n    cset w9, eq\n"),
+                BinOp::Ne => out.push_str("    cmp x9, x10\n    cset w9, ne\n"),
+                BinOp::BitAnd => out.push_str("    and x9, x9, x10\n"),
+                BinOp::BitOr => out.push_str("    orr x9, x9, x10\n"),
+                BinOp::BitXor => out.push_str("    eor x9, x9, x10\n"),
+                BinOp::Shl => out.push_str("    lsl x9, x9, x10\n"),
+                BinOp::Shr => out.push_str("    asr x9, x9, x10\n"),
+            }
+            // 比较结果是 32 位 0/1（在 w9），算术结果是 64 位（在 x9）
+            if is_compare_binop(op) {
+                let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
+            } else {
+                let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+            }
+        }
+        Instr::NegL { dst, src } => {
+            let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*src));
+            out.push_str("    neg x9, x9\n");
+            let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
+        Instr::Widen { dst, src } => {
+            // 符号扩展 32→64（int → long）
+            let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*src));
+            out.push_str("    sxtw x9, w9\n");
+            let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
+        Instr::LongToFloat { dst, src } => {
+            let _ = writeln!(out, "    ldr x9, [sp, #{}]", slot(*src));
+            out.push_str("    scvtf d0, x9\n");
+            let _ = writeln!(out, "    str d0, [sp, #{}]", slot(*dst));
+        }
+        Instr::FloatToLong { dst, src } => {
+            let _ = writeln!(out, "    ldr d0, [sp, #{}]", slot(*src));
+            out.push_str("    fcvtzs x9, d0\n");
+            let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
     }
 }
 
@@ -508,6 +567,18 @@ fn materialize_const(value: i64, out: &mut String) {
     let _ = writeln!(out, "    movz w9, #{}", lo);
     if hi != 0 {
         let _ = writeln!(out, "    movk w9, #{}, lsl #16", hi);
+    }
+}
+
+/// 把 64 位常量装入 x9：movz 最低半字，其余非零半字 movk 到对应位。
+fn materialize_const64(value: i64, out: &mut String) {
+    let u = value as u64;
+    let h0 = u & 0xffff;
+    let _ = writeln!(out, "    movz x9, #{}", h0);
+    for (shift, hw) in [(16, (u >> 16) & 0xffff), (32, (u >> 32) & 0xffff), (48, (u >> 48) & 0xffff)] {
+        if hw != 0 {
+            let _ = writeln!(out, "    movk x9, #{}, lsl #{}", hw, shift);
+        }
     }
 }
 
@@ -583,6 +654,32 @@ mod tests {
         let asm = asm_arm64("int printf(char* fmt, ...); int main(){ printf(\"%f\", 3.5); return 0; }");
         assert!(asm.contains("bl _printf"));
         assert!(asm.contains("sub sp, sp, #")); // double 实参压栈
+    }
+
+    #[test]
+    fn arm64_long_arith_uses_64bit_ops() {
+        let asm = asm_arm64("long f(long a, long b){ return a * b; } int main(){ return 0; }");
+        assert!(asm.contains("mul x9, x9, x10")); // 64 位乘
+        assert!(asm.contains("ldr x0, [sp")); // long 返回走 x0（8 字节）
+    }
+
+    #[test]
+    fn arm64_int_to_long_sign_extends() {
+        let asm = asm_arm64("long f(int x){ long y = x; return y; } int main(){ return 0; }");
+        assert!(asm.contains("sxtw x9, w9")); // int→long 符号扩展
+    }
+
+    #[test]
+    fn arm64_long_constant_materialized_64bit() {
+        // 5e9 超 32 位 → movk 到高半字（bit 32）
+        let asm = asm_arm64("long f(){ return 5000000000; } int main(){ return 0; }");
+        assert!(asm.contains("movk x9, ") && asm.contains("lsl #32"));
+    }
+
+    #[test]
+    fn arm64_long_compare_uses_64bit() {
+        let asm = asm_arm64("int f(long a, long b){ return a < b; } int main(){ return 0; }");
+        assert!(asm.contains("cmp x9, x10")); // 64 位比较
     }
 
     fn gen(func_body: Vec<Instr>, frame_bytes: usize) -> String {

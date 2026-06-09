@@ -301,6 +301,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                             format!("invalid base-{} literal '{}'", radix, digits),
                         )
                     })?;
+                    while i < chars.len() && matches!(chars[i], 'l' | 'L' | 'u' | 'U') {
+                        i += 1;
+                        col += 1;
+                    }
                     tokens.push(Token {
                         kind: TokenKind::IntLit(value),
                         span: Span::new(line, start_col),
@@ -340,6 +344,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                             format!("invalid integer literal '{}'", num),
                         )
                     })?;
+                    // 消费整数后缀 L/U（不影响数值，仅避免被当作标识符）
+                    while i < chars.len() && matches!(chars[i], 'l' | 'L' | 'u' | 'U') {
+                        i += 1;
+                        col += 1;
+                    }
                     tokens.push(Token {
                         kind: TokenKind::IntLit(value),
                         span: Span::new(line, start_col),
@@ -375,6 +384,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     "case" => TokenKind::KwCase,
                     "default" => TokenKind::KwDefault,
                     "double" | "float" => TokenKind::KwDouble,
+                    "long" => TokenKind::KwLong,
                     _ => TokenKind::Ident(ident),
                 };
                 tokens.push(Token { kind, span: Span::new(line, start_col) });

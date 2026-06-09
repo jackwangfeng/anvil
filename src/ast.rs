@@ -97,6 +97,11 @@ pub enum Expr {
     },
     SizeofType(Type),
     SizeofExpr(Box<Expr>),
+    /// 强制类型转换 `(ty)expr`。
+    Cast {
+        ty: Type,
+        expr: Box<Expr>,
+    },
     Unary {
         op: UnaryOp,
         operand: Box<Expr>,

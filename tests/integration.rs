@@ -613,3 +613,83 @@ fn m12_struct_roundtrip() {
     let src = "struct P { int x; int y; }; struct P make(int a,int b){ struct P p; p.x=a; p.y=b; return p; } int sum(struct P p){ return p.x+p.y; }\nint main(){ return sum(make(40, 2)); }";
     assert_eq!(compile_and_run(src, "m12_s_rt"), 42);
 }
+
+// ---- M13: long（64 位整数）+ (type)expr 强制类型转换 ----
+
+#[test]
+fn m13_long_arithmetic_64bit() {
+    // 10^6 * 10^6 = 10^12，远超 32 位
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ long x = 1000000; long y = x * x; printf(\"%ld\\n\", y); return 0; }",
+        "m13_long_arith",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "1000000000000\n");
+}
+
+#[test]
+fn m13_long_param_and_return() {
+    // 形参与返回值都是 64 位
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nlong mul(long a, long b){ return a * b; }\nint main(){ printf(\"%ld\\n\", mul(3000000000, 3)); return 0; }",
+        "m13_long_pr",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "9000000000\n");
+}
+
+#[test]
+fn m13_long_global_accumulate() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nlong total = 0;\nint main(){ int i; for (i = 0; i < 5; i++) total = total + 1000000000; printf(\"%ld\\n\", total); return 0; }",
+        "m13_long_glob",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "5000000000\n");
+}
+
+#[test]
+fn m13_long_recursion_factorial() {
+    // 20! 需要 64 位；三元分支 int : long 取公共类型 long
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nlong fact(int n){ return n <= 1 ? 1 : n * (long)fact(n-1); }\nint main(){ printf(\"%ld\\n\", fact(20)); return 0; }",
+        "m13_long_fact",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "2432902008176640000\n");
+}
+
+#[test]
+fn m13_long_comparison() {
+    // 5e9 > 4e9 的 64 位比较
+    let src = "int main(){ long a = 5000000000; long b = 4000000000; return a > b; }";
+    assert_eq!(compile_and_run(src, "m13_long_cmp"), 1);
+}
+
+#[test]
+fn m13_cast_double_to_int_truncates() {
+    let src = "int main(){ double d = 7.9; int n = (int)d; return n; }";
+    assert_eq!(compile_and_run(src, "m13_cast_d2i"), 7);
+}
+
+#[test]
+fn m13_cast_int_to_double_in_expr() {
+    // (double)7 / 2 = 3.5（若按 int 除则为 3）
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ int x = 7; printf(\"%f\\n\", (double)x / 2); return 0; }",
+        "m13_cast_i2d",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "3.500000\n");
+}
+
+#[test]
+fn m13_cast_int_to_long_widens() {
+    // (long)大int 相乘不溢出
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ int x = 100000; long y = (long)x * x; printf(\"%ld\\n\", y); return 0; }",
+        "m13_cast_i2l",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "10000000000\n");
+}

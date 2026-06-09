@@ -91,6 +91,33 @@ pub enum Instr {
         dst: Temp,
         src: Temp,
     },
+    /// 64 位有符号整数二元运算（long）。与 32 位 `Bin` 并列，类比 `BinF`。
+    BinL {
+        dst: Temp,
+        op: BinOp,
+        lhs: Temp,
+        rhs: Temp,
+    },
+    /// 64 位取负。
+    NegL {
+        dst: Temp,
+        src: Temp,
+    },
+    /// 符号扩展 32→64（int → long）。
+    Widen {
+        dst: Temp,
+        src: Temp,
+    },
+    /// 64 位整数 → double。
+    LongToFloat {
+        dst: Temp,
+        src: Temp,
+    },
+    /// double → 64 位整数。
+    FloatToLong {
+        dst: Temp,
+        src: Temp,
+    },
     StrLit { dst: Temp, index: usize },
     AddrOf { dst: Temp, off: usize },
     GlobalAddr { dst: Temp, name: String },
@@ -250,21 +277,25 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// 在 int 与 double 之间按需插入转换指令，返回结果临时量。
+    /// 按需在数值类型间插入转换指令（int/char ↔ long/指针 ↔ double），返回结果临时量。
     fn coerce(&mut self, t: Temp, from: &Type, to: &Type) -> Temp {
-        let from_f = matches!(from, Type::Double);
-        let to_f = matches!(to, Type::Double);
-        if from_f && !to_f {
-            let dst = self.fresh();
-            self.body.push(Instr::FloatToInt { dst, src: t });
-            dst
-        } else if !from_f && to_f {
-            let dst = self.fresh();
-            self.body.push(Instr::IntToFloat { dst, src: t });
-            dst
-        } else {
-            t
+        use NumKind::*;
+        let (fk, tk) = (num_kind(from), num_kind(to));
+        if fk == tk {
+            return t; // 同类（如 int↔char、long↔指针）无需转换
         }
+        let dst = self.fresh();
+        let instr = match (fk, tk) {
+            (Float, Narrow) => Instr::FloatToInt { dst, src: t },
+            (Float, Wide) => Instr::FloatToLong { dst, src: t },
+            (Narrow, Float) => Instr::IntToFloat { dst, src: t },
+            (Wide, Float) => Instr::LongToFloat { dst, src: t },
+            (Narrow, Wide) => Instr::Widen { dst, src: t }, // 符号扩展 32→64
+            (Wide, Narrow) => return t,                     // 截断：取低 32 位，无需指令
+            _ => return t,                                  // void/struct 等不转换
+        };
+        self.body.push(instr);
+        dst
     }
 
     /// 取变量地址：局部用 AddrOf，全局用 GlobalAddr。返回 (地址临时量, 变量类型)。
@@ -327,7 +358,7 @@ impl<'a> Lowerer<'a> {
                         self.body.push(Instr::Return {
                             src,
                             is_float: matches!(ret_ty, Type::Double),
-                            width: if matches!(ret_ty, Type::Pointer(_)) { 8 } else { 4 },
+                            width: if matches!(ret_ty, Type::Pointer(_) | Type::Long) { 8 } else { 4 },
                             agg: None,
                         });
                     }
@@ -499,7 +530,13 @@ impl<'a> Lowerer<'a> {
             Expr::IntLit(v) => {
                 let dst = self.fresh();
                 self.body.push(Instr::Const { dst, value: *v });
-                (dst, Type::Int)
+                // 超出 32 位范围的字面量按 long（保证 64 位物化与运算）
+                let ty = if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                    Type::Int
+                } else {
+                    Type::Long
+                };
+                (dst, ty)
             }
             Expr::FloatLit(v) => {
                 let index = self.floats.len();
@@ -592,15 +629,37 @@ impl<'a> Lowerer<'a> {
                 self.body.push(Instr::Const { dst, value });
                 (dst, Type::Int)
             }
+            Expr::Cast { ty, expr } => {
+                let (v, vty) = self.lower_expr(expr);
+                let r = self.coerce(v, &vty, ty);
+                (r, ty.clone())
+            }
             Expr::Unary { op, operand } => {
-                let (src, _ty) = self.lower_expr(operand);
+                let (src, ty) = self.lower_expr(operand);
                 match op {
-                    UnaryOp::Plus => (src, Type::Int),
-                    UnaryOp::Neg => {
-                        let dst = self.fresh();
-                        self.body.push(Instr::Neg { dst, src });
-                        (dst, Type::Int)
-                    }
+                    UnaryOp::Plus => (src, ty),
+                    UnaryOp::Neg => match num_kind(&ty) {
+                        NumKind::Wide => {
+                            let dst = self.fresh();
+                            self.body.push(Instr::NegL { dst, src });
+                            (dst, Type::Long)
+                        }
+                        NumKind::Float => {
+                            // 浮点取负：0.0 - x
+                            let zero = self.fresh();
+                            let index = self.floats.len();
+                            self.floats.push(0f64.to_bits());
+                            self.body.push(Instr::ConstF { dst: zero, index });
+                            let dst = self.fresh();
+                            self.body.push(Instr::BinF { dst, op: BinOp::Sub, lhs: zero, rhs: src });
+                            (dst, Type::Double)
+                        }
+                        _ => {
+                            let dst = self.fresh();
+                            self.body.push(Instr::Neg { dst, src });
+                            (dst, Type::Int)
+                        }
+                    },
                 }
             }
             Expr::Binary { op, lhs, rhs } => self.lower_binary(*op, lhs, rhs),
@@ -641,20 +700,24 @@ impl<'a> Lowerer<'a> {
                 (result, Type::Int)
             }
             Expr::Ternary { cond, then_e, else_e } => {
+                // 两分支取公共类型（如 int : long → long），各自转换到该类型再合并
+                let common = common_type(&self.type_of(then_e), &self.type_of(else_e));
+                let width = self.size_of(&common);
                 let lelse = self.new_label();
                 let lend = self.new_label();
                 let (c, _) = self.lower_expr(cond);
                 self.body.push(Instr::JumpIfZero { cond: c, target: lelse });
-                let (tv, tty) = self.lower_expr(then_e);
-                let width = self.size_of(&tty);
+                let (tv0, tty) = self.lower_expr(then_e);
+                let tv = self.coerce(tv0, &tty, &common);
                 let result = self.fresh();
                 self.body.push(Instr::Copy { dst: result, src: tv, width });
                 self.body.push(Instr::Jump(lend));
                 self.body.push(Instr::Label(lelse));
-                let (ev, _) = self.lower_expr(else_e);
+                let (ev0, ety) = self.lower_expr(else_e);
+                let ev = self.coerce(ev0, &ety, &common);
                 self.body.push(Instr::Copy { dst: result, src: ev, width });
                 self.body.push(Instr::Label(lend));
-                (result, tty)
+                (result, common)
             }
             Expr::Assign { target, value } => {
                 let (v0, vty) = self.lower_expr(value);
@@ -690,7 +753,7 @@ impl<'a> Lowerer<'a> {
                     Type::Struct(_) | Type::Union(_) => Some(self.size_of(&ret)),
                     _ => None,
                 };
-                let ret_width = if matches!(ret, Type::Pointer(_) | Type::Double) {
+                let ret_width = if matches!(ret, Type::Pointer(_) | Type::Double | Type::Long) {
                     8
                 } else {
                     4
@@ -832,6 +895,20 @@ impl<'a> Lowerer<'a> {
             };
             return (dst, result_ty);
         }
+        // 64 位整数运算：任一操作数为 long 即走 64 位路径（int 操作数符号扩展提升）
+        if matches!(lty, Type::Long) || matches!(rty, Type::Long) {
+            let ll = self.coerce(l, &lty, &Type::Long);
+            let rr = self.coerce(r, &rty, &Type::Long);
+            let dst = self.fresh();
+            self.body.push(Instr::BinL {
+                dst,
+                op: lower_binop(op),
+                lhs: ll,
+                rhs: rr,
+            });
+            let result_ty = if is_compare(op) { Type::Int } else { Type::Long };
+            return (dst, result_ty);
+        }
         let dst = self.fresh();
         self.body.push(Instr::Bin {
             dst,
@@ -842,16 +919,40 @@ impl<'a> Lowerer<'a> {
         (dst, Type::Int)
     }
 
-    /// 仅推断类型（用于 sizeof(expr)，不求值操作数）。
+    /// 仅推断类型（用于 sizeof / 三元公共类型，不求值操作数）。
     fn type_of(&self, e: &Expr) -> Type {
         match e {
-            Expr::IntLit(_)
-            | Expr::Unary { .. }
-            | Expr::Binary { .. }
-            | Expr::Call { .. }
-            | Expr::Logical { .. }
-            | Expr::SizeofType(_)
-            | Expr::SizeofExpr(_) => Type::Int,
+            Expr::IntLit(v) => {
+                if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                    Type::Int
+                } else {
+                    Type::Long
+                }
+            }
+            Expr::Logical { .. } | Expr::SizeofType(_) | Expr::SizeofExpr(_) => Type::Int,
+            Expr::Cast { ty, .. } => ty.clone(),
+            Expr::Call { name, .. } => self
+                .signatures
+                .get(name)
+                .map(|s| s.ret.clone())
+                .unwrap_or(Type::Int),
+            Expr::Unary { op, operand } => match op {
+                UnaryOp::Neg | UnaryOp::Plus => self.type_of(operand),
+            },
+            Expr::Binary { op, lhs, rhs } => {
+                if is_compare(*op) {
+                    return Type::Int;
+                }
+                let lt = self.type_of(lhs).decay();
+                let rt = self.type_of(rhs).decay();
+                // 指针算术：指针 ± 整数 → 指针
+                if matches!(op, BinaryOp::Add | BinaryOp::Sub)
+                    && (lt.is_pointer_like() ^ rt.is_pointer_like())
+                {
+                    return if lt.is_pointer_like() { lt } else { rt };
+                }
+                common_type(&lt, &rt)
+            }
             Expr::Ternary { then_e, .. } => self.type_of(then_e),
             Expr::FloatLit(_) => Type::Double,
             Expr::StrLit(_) => Type::Pointer(Box::new(Type::Char)),
@@ -910,6 +1011,46 @@ impl<'a> Lowerer<'a> {
                 .unwrap_or(Type::Int),
             _ => Type::Int,
         }
+    }
+}
+
+/// 数值类型的运算宽度类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumKind {
+    /// 32 位整数：int / char。
+    Narrow,
+    /// 64 位整数语义：long / 指针 / 数组（退化后的地址）。
+    Wide,
+    /// 浮点：double。
+    Float,
+    /// 不参与数值转换：void / struct / union。
+    Other,
+}
+
+fn num_kind(ty: &Type) -> NumKind {
+    match ty {
+        Type::Int | Type::Char => NumKind::Narrow,
+        Type::Long | Type::Pointer(_) | Type::Array(..) => NumKind::Wide,
+        Type::Double => NumKind::Float,
+        _ => NumKind::Other,
+    }
+}
+
+/// 二元/三元运算的公共结果类型（C 的“通常算术转换”简化版）。
+fn common_type(a: &Type, b: &Type) -> Type {
+    match (num_kind(a), num_kind(b)) {
+        (NumKind::Float, _) | (_, NumKind::Float) => Type::Double,
+        (NumKind::Wide, _) | (_, NumKind::Wide) => {
+            // 两侧同为指针时保留指针类型，否则按 64 位整数
+            if a.is_pointer_like() {
+                a.decay()
+            } else if b.is_pointer_like() {
+                b.decay()
+            } else {
+                Type::Long
+            }
+        }
+        _ => Type::Int,
     }
 }
 
