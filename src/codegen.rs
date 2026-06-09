@@ -7,6 +7,7 @@ pub fn generate(program: &Program) -> String {
     for func in &program.functions {
         gen_func(func, &mut out);
     }
+    let mut out = peephole(&out);
     gen_strings(&program.strings, &mut out);
     gen_globals(&program.globals, &mut out);
     gen_floats(&program.floats, &mut out);
@@ -18,6 +19,61 @@ fn is_compare_binop(op: &BinOp) -> bool {
         op,
         BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::Eq | BinOp::Ne
     )
+}
+
+/// 窥孔优化：相邻的 `str rN, [sp,#k]` + `ldr rM, [sp,#k]`（同槽位、同寄存器宽度类）
+/// → 把内存载入改为寄存器搬移（同寄存器则删除）。保守：仅相邻两行、其间无标签/跳转。
+fn peephole(asm: &str) -> String {
+    let lines: Vec<&str> = asm.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if i + 1 < lines.len() {
+            if let (Some((sreg, smem)), Some((lreg, lmem))) =
+                (parse_str(lines[i]), parse_ldr(lines[i + 1]))
+            {
+                // 同槽位且寄存器宽度类一致（w/x/d 首字母相同）
+                if smem == lmem && sreg.chars().next() == lreg.chars().next() {
+                    out.push(lines[i].to_string()); // 保留 store
+                    if sreg != lreg {
+                        let mv = if sreg.starts_with('d') { "fmov" } else { "mov" };
+                        out.push(format!("    {} {}, {}", mv, lreg, sreg));
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        out.push(lines[i].to_string());
+        i += 1;
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
+/// 解析 `    str <reg>, [sp, #<k>]` → (reg, "[sp, #k]")。
+fn parse_str(line: &str) -> Option<(&str, &str)> {
+    let t = line.trim_start();
+    let rest = t.strip_prefix("str ")?;
+    let (reg, mem) = rest.split_once(", ")?;
+    if mem.starts_with("[sp, #") && mem.ends_with(']') {
+        Some((reg, mem))
+    } else {
+        None
+    }
+}
+
+/// 解析 `    ldr <reg>, [sp, #<k>]` → (reg, "[sp, #k]")。
+fn parse_ldr(line: &str) -> Option<(&str, &str)> {
+    let t = line.trim_start();
+    let rest = t.strip_prefix("ldr ")?;
+    let (reg, mem) = rest.split_once(", ")?;
+    if mem.starts_with("[sp, #") && mem.ends_with(']') {
+        Some((reg, mem))
+    } else {
+        None
+    }
 }
 
 fn gen_floats(floats: &[u64], out: &mut String) {
@@ -725,10 +781,33 @@ mod tests {
     }
 
     #[test]
+    fn peephole_arm64_forwards_store_to_load() {
+        let asm = "    str w9, [sp, #0]\n    ldr w0, [sp, #0]\n";
+        let out = peephole(asm);
+        assert!(out.contains("str w9, [sp, #0]")); // store 保留
+        assert!(out.contains("mov w0, w9")); // 载入 → 寄存器搬移
+        assert!(!out.contains("ldr w0, [sp, #0]"));
+    }
+
+    #[test]
+    fn peephole_arm64_drops_noop_and_respects_width() {
+        // 同寄存器 → 删除 load
+        let a = peephole("    str x9, [sp, #8]\n    ldr x9, [sp, #8]\n");
+        assert_eq!(a.matches("ldr").count(), 0);
+        // 宽度类不同（w vs x）→ 不改写
+        let b = peephole("    str w9, [sp, #8]\n    ldr x0, [sp, #8]\n");
+        assert!(b.contains("ldr x0, [sp, #8]"));
+        // 指针解引用（非 [sp,#]）→ 不碰
+        let c = peephole("    str x10, [x9]\n    ldr x10, [x9]\n");
+        assert!(c.contains("ldr x10, [x9]"));
+    }
+
+    #[test]
     fn arm64_long_arith_uses_64bit_ops() {
         let asm = asm_arm64("long f(long a, long b){ return a * b; } int main(){ return 0; }");
         assert!(asm.contains("mul x9, x9, x10")); // 64 位乘
-        assert!(asm.contains("ldr x0, [sp")); // long 返回走 x0（8 字节）
+        // long 返回经 x0（窥孔后可能是 ldr x0 或 mov x0,xN）
+        assert!(asm.contains("ldr x0, [sp") || asm.contains("mov x0, x"));
     }
 
     #[test]

@@ -838,6 +838,12 @@ impl<'a> Lowerer<'a> {
                 }
             }
             Expr::Unary { op, operand } => {
+                // 常量折叠（如 -5、~0xF）
+                if let Some(v) = const_eval(e) {
+                    let dst = self.fresh();
+                    self.body.push(Instr::Const { dst, value: v as i64 });
+                    return (dst, Type::Int);
+                }
                 let (src, ty) = self.lower_expr(operand);
                 match op {
                     UnaryOp::Plus => (src, ty),
@@ -865,7 +871,15 @@ impl<'a> Lowerer<'a> {
                     },
                 }
             }
-            Expr::Binary { op, lhs, rhs } => self.lower_binary(*op, lhs, rhs),
+            Expr::Binary { op, lhs, rhs } => {
+                // 常量折叠：整个表达式是常量 → 直接发一个常数
+                if let Some(v) = const_eval(e) {
+                    let dst = self.fresh();
+                    self.body.push(Instr::Const { dst, value: v as i64 });
+                    return (dst, Type::Int);
+                }
+                self.lower_binary(*op, lhs, rhs)
+            }
             Expr::Logical { op, lhs, rhs } => {
                 let result = self.fresh();
                 match op {
@@ -1347,6 +1361,55 @@ fn common_type(a: &Type, b: &Type) -> Type {
     }
 }
 
+/// 常量折叠：纯整数常量表达式在编译期求值（按 32 位回绕，匹配 anvil 的 int 运行时语义）。
+/// 任一叶子非 i32 范围常量、或除零，则返回 None（不折叠）。
+fn const_eval(e: &Expr) -> Option<i32> {
+    match e {
+        Expr::IntLit(v) if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 => Some(*v as i32),
+        Expr::Unary { op, operand } => {
+            let v = const_eval(operand)?;
+            Some(match op {
+                UnaryOp::Neg => v.wrapping_neg(),
+                UnaryOp::Plus => v,
+            })
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let a = const_eval(lhs)?;
+            let b = const_eval(rhs)?;
+            let r = match op {
+                BinaryOp::Add => a.wrapping_add(b),
+                BinaryOp::Sub => a.wrapping_sub(b),
+                BinaryOp::Mul => a.wrapping_mul(b),
+                BinaryOp::Div => {
+                    if b == 0 {
+                        return None;
+                    }
+                    a.wrapping_div(b)
+                }
+                BinaryOp::Mod => {
+                    if b == 0 {
+                        return None;
+                    }
+                    a.wrapping_rem(b)
+                }
+                BinaryOp::BitAnd => a & b,
+                BinaryOp::BitOr => a | b,
+                BinaryOp::BitXor => a ^ b,
+                BinaryOp::Shl => a.wrapping_shl(b as u32),
+                BinaryOp::Shr => a.wrapping_shr(b as u32),
+                BinaryOp::Lt => (a < b) as i32,
+                BinaryOp::Gt => (a > b) as i32,
+                BinaryOp::Le => (a <= b) as i32,
+                BinaryOp::Ge => (a >= b) as i32,
+                BinaryOp::Eq => (a == b) as i32,
+                BinaryOp::Ne => (a != b) as i32,
+            };
+            Some(r)
+        }
+        _ => None,
+    }
+}
+
 fn is_compare(op: BinaryOp) -> bool {
     matches!(
         op,
@@ -1470,17 +1533,31 @@ mod tests {
 
     #[test]
     fn lower_add() {
-        let f = lower_src("int main(){ return 1+2; }");
-        assert_eq!(f.frame_bytes, 24);
-        assert_eq!(
-            f.body,
-            vec![
-                Instr::Const { dst: 0, value: 1 },
-                Instr::Const { dst: 8, value: 2 },
-                Instr::Bin { dst: 16, op: BinOp::Add, lhs: 0, rhs: 8 },
-                Instr::Return { src: 16, is_float: false, width: 4, agg: None },
-            ]
-        );
+        // 非常量操作数：仍走 Bin（常量会被折叠，故用变量）
+        let f = lower_src("int main(){ int x = 1; return x + 2; }");
+        assert!(f.body.iter().any(|i| matches!(i, Instr::Bin { op: BinOp::Add, .. })));
+    }
+
+    #[test]
+    fn lower_const_folds_arithmetic() {
+        // 1 + 2*3 - (4/2) = 5 全是常量 → 折成单个 Const，无 Bin
+        let f = lower_src("int main(){ return 1 + 2*3 - (4/2); }");
+        assert!(!f.body.iter().any(|i| matches!(i, Instr::Bin { .. })));
+        assert!(f.body.iter().any(|i| matches!(i, Instr::Const { value: 5, .. })));
+    }
+
+    #[test]
+    fn lower_const_folds_bitwise_and_compare() {
+        let f = lower_src("int main(){ return (0xF0 | 0x0F) == 255; }");
+        assert!(!f.body.iter().any(|i| matches!(i, Instr::Bin { .. })));
+        assert!(f.body.iter().any(|i| matches!(i, Instr::Const { value: 1, .. })));
+    }
+
+    #[test]
+    fn lower_no_fold_div_by_zero() {
+        // 除零不在编译期折叠（交由运行时）
+        let f = lower_src("int main(){ return 1 / 0; }");
+        assert!(f.body.iter().any(|i| matches!(i, Instr::Bin { op: BinOp::Div, .. })));
     }
 
     #[test]
@@ -1498,15 +1575,12 @@ mod tests {
 
     #[test]
     fn lower_unary_neg() {
-        let f = lower_src("int main(){ return -7; }");
-        assert_eq!(
-            f.body,
-            vec![
-                Instr::Const { dst: 0, value: 7 },
-                Instr::Neg { dst: 8, src: 0 },
-                Instr::Return { src: 8, is_float: false, width: 4, agg: None },
-            ]
-        );
+        // 非常量操作数仍走 Neg；常量 -x 会被折叠
+        let f = lower_src("int main(){ int x = 7; return -x; }");
+        assert!(f.body.iter().any(|i| matches!(i, Instr::Neg { .. })));
+        let g = lower_src("int main(){ return -7; }");
+        assert!(g.body.iter().any(|i| matches!(i, Instr::Const { value: -7, .. })));
+        assert!(!g.body.iter().any(|i| matches!(i, Instr::Neg { .. })));
     }
 
     #[test]

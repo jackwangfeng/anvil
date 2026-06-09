@@ -12,12 +12,77 @@ pub fn generate(program: &Program) -> String {
     for func in &program.functions {
         gen_func(func, &mut out);
     }
+    let mut out = peephole(&out);
     gen_strings(&program.strings, &mut out);
     gen_globals(&program.globals, &mut out);
     gen_floats(&program.floats, &mut out);
     // 标注栈不可执行（消除 GNU ld 的 executable-stack 警告）。
     out.push_str(".section .note.GNU-stack,\"\",@progbits\n");
     out
+}
+
+/// 窥孔优化：相邻的"存某帧槽位 + 立即从同槽位载入"——把内存载入改成寄存器/立即数搬移，
+/// 二者相等则整条删去。保守：仅匹配 `disp(%rbp)` 槽位、同助记符、相邻两行（其间无标签/跳转）。
+fn peephole(asm: &str) -> String {
+    // 仅对函数代码段（.text 段，gen_strings 等尚未追加）逐行处理。
+    let lines: Vec<&str> = asm.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if i + 1 < lines.len() {
+            if let (Some((mn, src, mem)), Some((mn2, mem2, dst))) =
+                (parse_store(lines[i]), parse_load(lines[i + 1]))
+            {
+                if mn == mn2 && mem == mem2 {
+                    out.push(lines[i].to_string()); // 保留 store（槽位可能后续仍被读）
+                    if src != dst {
+                        out.push(format!("    {} {}, {}", mn, src, dst));
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        out.push(lines[i].to_string());
+        i += 1;
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
+const MOV_MNEMONICS: [&str; 4] = ["movl", "movq", "movb", "movsd"];
+
+/// 解析 `    <mn> <src>, disp(%rbp)`：src 为寄存器/立即数，目标是帧槽位。
+fn parse_store(line: &str) -> Option<(&str, &str, &str)> {
+    let t = line.trim_start();
+    let (mn, rest) = t.split_once(' ')?;
+    if !MOV_MNEMONICS.contains(&mn) {
+        return None;
+    }
+    let (src, mem) = rest.rsplit_once(", ")?;
+    if !is_rbp_slot(mem) || !(src.starts_with('%') || src.starts_with('$')) {
+        return None;
+    }
+    Some((mn, src, mem))
+}
+
+/// 解析 `    <mn> disp(%rbp), <dst>`：从帧槽位载入到寄存器。
+fn parse_load(line: &str) -> Option<(&str, &str, &str)> {
+    let t = line.trim_start();
+    let (mn, rest) = t.split_once(' ')?;
+    if !MOV_MNEMONICS.contains(&mn) {
+        return None;
+    }
+    let (mem, dst) = rest.split_once(", ")?;
+    if !is_rbp_slot(mem) || !dst.starts_with('%') {
+        return None;
+    }
+    Some((mn, mem, dst))
+}
+
+fn is_rbp_slot(s: &str) -> bool {
+    s.ends_with("(%rbp)") && s[..s.len() - 6].chars().all(|c| c.is_ascii_digit() || c == '-')
 }
 
 /// frame_bytes 向上对齐到 16（保证调用点 rsp 16 字节对齐）。
@@ -659,6 +724,30 @@ mod tests {
             globals: vec![],
             floats: vec![],
         })
+    }
+
+    #[test]
+    fn peephole_forwards_store_to_load() {
+        let asm = "    movl $42, -8(%rbp)\n    movl -8(%rbp), %eax\n";
+        let out = peephole(asm);
+        assert!(out.contains("movl $42, -8(%rbp)")); // store 保留
+        assert!(out.contains("movl $42, %eax")); // 内存载入 → 立即数搬移
+        assert!(!out.contains("movl -8(%rbp), %eax")); // 原内存载入消失
+    }
+
+    #[test]
+    fn peephole_drops_noop_reload() {
+        let asm = "    movl %eax, -8(%rbp)\n    movl -8(%rbp), %eax\n";
+        let out = peephole(asm);
+        assert_eq!(out.matches("movl").count(), 1); // 同源 load 删除，仅留 store
+    }
+
+    #[test]
+    fn peephole_keeps_different_slot() {
+        // 不同槽位不应被改写
+        let asm = "    movl $1, -8(%rbp)\n    movl -16(%rbp), %eax\n";
+        let out = peephole(asm);
+        assert!(out.contains("movl -16(%rbp), %eax"));
     }
 
     #[test]
