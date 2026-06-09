@@ -13,7 +13,10 @@ use std::fmt::Write;
 pub fn generate(program: &Program) -> Result<String, String> {
     let mut out = String::new();
     out.push_str("target triple = \"x86_64-pc-linux-gnu\"\n");
+    out.push_str("%struct.__va_list_tag = type { i32, i32, ptr, ptr }\n");
     out.push_str("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n");
+    out.push_str("declare void @llvm.va_start(ptr)\n");
+    out.push_str("declare void @llvm.va_end(ptr)\n");
 
     // 字符串常量
     for (i, s) in program.strings.iter().enumerate() {
@@ -59,25 +62,33 @@ pub fn generate(program: &Program) -> Result<String, String> {
     Ok(out)
 }
 
-/// 标量返回/参数的 LLVM 类型:double / i64(整型/指针统一 8 字节)。
-fn ret_type(f: &Function) -> &'static str {
+/// 返回类型的 LLVM 文本:`[N x i8]`(结构体) / double / i64 / i32(main) / void。
+fn ret_type(f: &Function) -> String {
+    if let Some(sz) = f.ret_agg {
+        return format!("[{} x i8]", sz);
+    }
     if f.name == "main" {
-        return "i32"; // main 按 C 约定返回 i32
+        return "i32".into(); // main 按 C 约定返回 i32
     }
     if f.ret_float {
-        return "double";
+        return "double".into();
     }
-    // 从函数体的 Return 推断有无返回值
-    let mut has_ret = false;
-    for i in &f.body {
-        if let Instr::Return { .. } = i {
-            has_ret = true;
-        }
-    }
+    let has_ret = f.body.iter().any(|i| matches!(i, Instr::Return { .. }));
     if has_ret {
-        "i64"
+        "i64".into()
     } else {
-        "void"
+        "void".into()
+    }
+}
+
+/// 标量/聚合形参或实参的 LLVM 类型:double / `[N x i8]`(结构体) / i64。
+fn scalar_or_agg_ty(is_float: bool, agg: Option<usize>) -> String {
+    if let Some(sz) = agg {
+        format!("[{} x i8]", sz)
+    } else if is_float {
+        "double".into()
+    } else {
+        "i64".into()
     }
 }
 
@@ -180,34 +191,21 @@ fn gen_func<'a>(
     declared: &'a mut HashSet<String>,
     decls: &'a mut String,
 ) -> Result<(), String> {
-    // 不支持:结构体按值返回
-    if func.ret_agg.is_some() {
-        return Err(format!(
-            "LLVM 后端暂不支持按值返回结构体(函数 {});请用原生后端",
-            func.name
-        ));
-    }
-    if func.variadic {
-        return Err(format!(
-            "LLVM 后端暂不支持用户自定义可变参数(函数 {});请用原生后端",
-            func.name
-        ));
-    }
-
     let rty = ret_type(func);
     // 参数类型与名字
     let mut params = String::new();
     for (i, p) in func.params.iter().enumerate() {
-        if p.is_aggregate {
-            return Err(format!(
-                "LLVM 后端暂不支持结构体按值传参(函数 {});请用原生后端",
-                func.name
-            ));
-        }
         if i > 0 {
             params.push_str(", ");
         }
-        let _ = write!(params, "{} %arg{}", if p.is_float { "double" } else { "i64" }, i);
+        let pty = scalar_or_agg_ty(p.is_float, if p.is_aggregate { Some(p.size) } else { None });
+        let _ = write!(params, "{} %arg{}", pty, i);
+    }
+    if func.variadic {
+        if !params.is_empty() {
+            params.push_str(", ");
+        }
+        params.push_str("...");
     }
 
     let _ = writeln!(out, "\ndefine {} @{}({}) {{", rty, func.name, params);
@@ -228,22 +226,26 @@ fn gen_func<'a>(
     g.emit(&format!("%frame = alloca [{} x i8], align 16", frame));
     // 形参落到各自槽位
     for (i, p) in func.params.iter().enumerate() {
-        if p.is_float {
+        if p.is_aggregate {
+            let pp = g.slot_ptr(p.slot);
+            g.emit(&format!("store [{} x i8] %arg{}, ptr {}", p.size, i, pp));
+        } else if p.is_float {
             g.store_f64(p.slot, &format!("%arg{}", i));
         } else {
             g.store_i64(p.slot, &format!("%arg{}", i));
         }
     }
     for instr in &func.body {
-        gen_instr(instr, rty, &mut g)?;
+        gen_instr(instr, &rty, &mut g)?;
     }
     // 函数末尾若仍未终结,补一个默认 return
     if g.open {
-        match rty {
+        match rty.as_str() {
             "void" => g.emit("ret void"),
             "double" => g.emit("ret double 0.0"),
             "i32" => g.emit("ret i32 0"),
-            _ => g.emit("ret i64 0"),
+            "i64" => g.emit("ret i64 0"),
+            other => g.emit(&format!("ret {} zeroinitializer", other)), // 结构体
         }
     }
 
@@ -472,8 +474,14 @@ fn gen_instr(instr: &Instr, rty: &str, g: &mut Gen) -> Result<(), String> {
         }
         Instr::Return { src, is_float, width, agg } => {
             g.ensure_open();
-            if agg.is_some() {
-                return Err("LLVM: 结构体按值返回不支持".into());
+            if let Some(sz) = agg {
+                // 结构体按值返回:src 存结构体地址,载入聚合值返回
+                let p = g.load_ptr(*src);
+                let v = g.val();
+                g.emit(&format!("{} = load [{} x i8], ptr {}", v, sz, p));
+                g.emit(&format!("ret [{} x i8] {}", sz, v));
+                g.open = false;
+                return Ok(());
             }
             match rty {
                 "void" => g.emit("ret void"),
@@ -517,23 +525,22 @@ fn gen_instr(instr: &Instr, rty: &str, g: &mut Gen) -> Result<(), String> {
             arg_aggs,
             ret_width,
             ret_agg,
-            ret_buf: _,
+            ret_buf,
             fixed,
             variadic,
             stack_varargs: _,
             ret_float,
         } => {
             g.ensure_open();
-            if via.is_some() {
-                return Err("LLVM: 函数指针间接调用不支持;请用原生后端".into());
-            }
-            if ret_agg.is_some() || arg_aggs.iter().any(|a| a.is_some()) {
-                return Err("LLVM: 结构体按值传参/返回不支持;请用原生后端".into());
-            }
-            // 取实参(double 或 i64)
+            // 实参:结构体 [N x i8](从地址载入聚合值)/ double / i64
             let mut argvals: Vec<(String, String)> = Vec::with_capacity(args.len());
             for (i, a) in args.iter().enumerate() {
-                if arg_floats.get(i).copied().unwrap_or(false) {
+                if let Some(sz) = arg_aggs.get(i).copied().flatten() {
+                    let p = g.load_ptr(*a); // 实参 temp 存结构体地址
+                    let v = g.val();
+                    g.emit(&format!("{} = load [{} x i8], ptr {}", v, sz, p));
+                    argvals.push((format!("[{} x i8]", sz), v));
+                } else if arg_floats.get(i).copied().unwrap_or(false) {
                     let v = g.load_f64(*a);
                     argvals.push(("double".to_string(), v));
                 } else {
@@ -542,85 +549,115 @@ fn gen_instr(instr: &Instr, rty: &str, g: &mut Gen) -> Result<(), String> {
                 }
             }
             // 调用结果类型
-            let cret = if *ret_float {
-                "double"
+            let cret: String = if let Some(sz) = ret_agg {
+                format!("[{} x i8]", sz)
+            } else if *ret_float {
+                "double".into()
             } else if *ret_width == 8 {
-                "i64"
+                "i64".into()
             } else {
-                "i32"
+                "i32".into()
             };
-            // 声明外部函数(非本程序定义的)
-            if !g.defined.contains(name.as_str()) && !g.declared.contains(name) {
-                g.declared.insert(name.clone());
-                let mut ptys = String::new();
-                for k in 0..*fixed.min(&args.len()) {
-                    if k > 0 {
-                        ptys.push_str(", ");
+            // 间接调用:取函数指针;直接调用:@name(必要时声明外部函数)
+            let callee = if let Some(t) = via {
+                g.load_ptr(*t)
+            } else {
+                if !g.defined.contains(name.as_str()) && !g.declared.contains(name) {
+                    g.declared.insert(name.clone());
+                    let mut ptys = String::new();
+                    for k in 0..*fixed.min(&args.len()) {
+                        if k > 0 {
+                            ptys.push_str(", ");
+                        }
+                        ptys.push_str(argvals.get(k).map(|(t, _)| t.as_str()).unwrap_or("i64"));
                     }
-                    ptys.push_str(if argvals.get(k).map(|(t, _)| t.as_str()) == Some("double") {
-                        "double"
-                    } else {
-                        "i64"
-                    });
-                }
-                if *variadic {
-                    if !ptys.is_empty() {
-                        ptys.push_str(", ");
+                    if *variadic {
+                        if !ptys.is_empty() {
+                            ptys.push_str(", ");
+                        }
+                        ptys.push_str("...");
                     }
-                    ptys.push_str("...");
+                    let _ = writeln!(g.decls, "declare {} @{}({})", cret, name, ptys);
                 }
-                let _ = writeln!(g.decls, "declare {} @{}({})", cret, name, ptys);
-            }
-            // 组装调用
+                format!("@{}", name)
+            };
             let arglist = argvals
                 .iter()
                 .map(|(t, v)| format!("{} {}", t, v))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let callee_ty = if *variadic {
-                // 变参需显式函数类型
+            // 变参调用需显式函数类型 `<ret> (<fixed...>, ...)`
+            let head = if *variadic {
                 let mut fixed_tys = String::new();
                 for k in 0..*fixed.min(&args.len()) {
                     if k > 0 {
                         fixed_tys.push_str(", ");
                     }
-                    fixed_tys.push_str(
-                        if argvals.get(k).map(|(t, _)| t.as_str()) == Some("double") {
-                            "double"
-                        } else {
-                            "i64"
-                        },
-                    );
+                    fixed_tys.push_str(argvals.get(k).map(|(t, _)| t.as_str()).unwrap_or("i64"));
                 }
                 if !fixed_tys.is_empty() {
                     fixed_tys.push_str(", ");
                 }
                 format!("{} ({}...)", cret, fixed_tys)
             } else {
-                String::new()
+                cret.clone()
             };
             if cret == "void" {
-                g.emit(&format!("call void @{}({})", name, arglist));
+                g.emit(&format!("call {} {}({})", head, callee, arglist));
             } else {
                 let r = g.val();
-                if *variadic {
-                    g.emit(&format!("{} = call {} @{}({})", r, callee_ty, name, arglist));
+                g.emit(&format!("{} = call {} {}({})", r, head, callee, arglist));
+                if let Some(sz) = ret_agg {
+                    // 结构体返回值写入缓冲区(ret_buf)
+                    if let Some(buf) = ret_buf {
+                        let p = g.slot_ptr(*buf);
+                        g.emit(&format!("store [{} x i8] {}, ptr {}", sz, r, p));
+                    }
                 } else {
-                    g.emit(&format!("{} = call {} @{}({})", r, cret, name, arglist));
-                }
-                // 存结果
-                match cret {
-                    "double" => g.store_f64(*dst, &r),
-                    "i64" => g.store_i64(*dst, &r),
-                    _ => g.store_i32(*dst, &r),
+                    match cret.as_str() {
+                        "double" => g.store_f64(*dst, &r),
+                        "i64" => g.store_i64(*dst, &r),
+                        _ => g.store_i32(*dst, &r),
+                    }
                 }
             }
         }
-        Instr::FuncAddr { .. } => {
-            return Err("LLVM: 函数指针(取函数地址)不支持;请用原生后端".into())
+        Instr::FuncAddr { dst, name } => {
+            g.ensure_open();
+            // 取函数地址 → 函数指针(以 i64 存槽位)
+            g.store_ptr(*dst, &format!("@{}", name));
         }
-        Instr::VaStart { .. } | Instr::VaArg { .. } => {
-            return Err("LLVM: 用户可变参数不支持;请用原生后端".into())
+        Instr::VaStart { ap } => {
+            g.ensure_open();
+            // 分配真正的 LLVM va_list,va_start,然后把其地址存入 anvil 的 va_list 变量槽
+            let vl = g.val();
+            g.emit(&format!("{} = alloca %struct.__va_list_tag", vl));
+            g.emit(&format!("call void @llvm.va_start(ptr {})", vl));
+            let apaddr = g.load_ptr(*ap); // ap 存的是 va_list 变量地址
+            let vlint = g.val();
+            g.emit(&format!("{} = ptrtoint ptr {} to i64", vlint, vl));
+            g.emit(&format!("store i64 {}, ptr {}", vlint, apaddr));
+        }
+        Instr::VaArg { dst, ap, width, is_float } => {
+            g.ensure_open();
+            let apaddr = g.load_ptr(*ap);
+            let vlint = g.val();
+            g.emit(&format!("{} = load i64, ptr {}", vlint, apaddr));
+            let vl = g.val();
+            g.emit(&format!("{} = inttoptr i64 {} to ptr", vl, vlint));
+            if *is_float {
+                let v = g.val();
+                g.emit(&format!("{} = va_arg ptr {}, double", v, vl));
+                g.store_f64(*dst, &v);
+            } else if *width == 8 {
+                let v = g.val();
+                g.emit(&format!("{} = va_arg ptr {}, i64", v, vl));
+                g.store_i64(*dst, &v);
+            } else {
+                let v = g.val();
+                g.emit(&format!("{} = va_arg ptr {}, i32", v, vl));
+                g.store_i32(*dst, &v);
+            }
         }
     }
     Ok(())
@@ -731,20 +768,23 @@ mod tests {
     }
 
     #[test]
-    fn struct_byval_param_is_unsupported() {
-        let r = llvm("struct P{int x;}; int f(struct P p){ return p.x; } int main(){ return 0; }");
-        assert!(r.is_err());
+    fn struct_byval_uses_byte_array_type() {
+        let ir = llvm("struct P{int x;int y;}; int f(struct P p){ return p.x; } int main(){ struct P q; q.x=1; q.y=2; return f(q); }").unwrap();
+        assert!(ir.contains("[16 x i8]")); // 16 字节结构体按值用 [16 x i8]
     }
 
     #[test]
-    fn function_pointer_is_unsupported() {
-        let r = llvm("int g(int x){return x;} int main(){ int(*f)(int)=g; return f(1); }");
-        assert!(r.is_err());
+    fn function_pointer_indirect_call() {
+        let ir = llvm("int g(int x){return x;} int main(){ int(*f)(int)=g; return f(1); }").unwrap();
+        assert!(ir.contains("ptrtoint ptr @g")); // 取函数地址
+        assert!(ir.contains("call i32 %")); // 经函数指针的间接调用(g 返回 int)
     }
 
     #[test]
-    fn user_varargs_is_unsupported() {
-        let r = llvm("int s(int n, ...){ va_list ap; va_start(ap,n); va_end(ap); return 0; } int main(){ return 0; }");
-        assert!(r.is_err());
+    fn user_varargs_uses_llvm_va() {
+        let ir = llvm("int s(int n, ...){ va_list ap; va_start(ap,n); int v=va_arg(ap,int); va_end(ap); return v; } int main(){ return s(1, 42); }").unwrap();
+        assert!(ir.contains("define i64 @s(i64 %arg0, ...)")); // 变参函数定义
+        assert!(ir.contains("@llvm.va_start"));
+        assert!(ir.contains("va_arg ptr"));
     }
 }

@@ -63,7 +63,8 @@ pub enum Instr {
     /// va_start：把 va_list（地址在 `ap`）置为首个可变参数的地址。
     VaStart { ap: Temp },
     /// va_arg：从 va_list（地址在 `ap`）取 `width` 字节到 `dst`，并把指针前进 8。
-    VaArg { dst: Temp, ap: Temp, width: usize },
+    /// `is_float` 区分整型/浮点(LLVM va_arg 需要;原生栈式遍历不区分)。
+    VaArg { dst: Temp, ap: Temp, width: usize, is_float: bool },
     Call {
         dst: Temp,
         name: String,
@@ -988,7 +989,8 @@ impl<'a> Lowerer<'a> {
                 let (ap_addr, _) = self.lower_lvalue(ap);
                 let dst = self.fresh();
                 let width = self.size_of(ty);
-                self.body.push(Instr::VaArg { dst, ap: ap_addr, width });
+                let is_float = matches!(ty, Type::Double);
+                self.body.push(Instr::VaArg { dst, ap: ap_addr, width, is_float });
                 (dst, ty.clone())
             }
         }

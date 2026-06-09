@@ -153,6 +153,12 @@ fn gen_func(func: &Function, out: &mut String) {
     for instr in &func.body {
         gen_instr(instr, &func.name, frame, func.sret_slot, va_base, out);
     }
+    // 兜底尾声:函数体未以 return 结束时避免坠落到下个函数(如无 return 的 void 函数)。
+    out.push_str("    mov w0, #0\n");
+    if frame > 0 {
+        let _ = writeln!(out, "    add sp, sp, #{}", frame);
+    }
+    out.push_str("    ldp x29, x30, [sp], #16\n    ret\n");
 }
 
 /// 一个实参/形参在 AAPCS64 下的去向。
@@ -394,7 +400,7 @@ fn gen_instr(
             let _ = writeln!(out, "    ldr x10, [sp, #{}]", slot(*ap)); // x10 = &va_list
             out.push_str("    str x9, [x10]\n");
         }
-        Instr::VaArg { dst, ap, width } => {
+        Instr::VaArg { dst, ap, width, is_float: _ } => {
             let _ = writeln!(out, "    ldr x10, [sp, #{}]", slot(*ap)); // &va_list
             out.push_str("    ldr x11, [x10]\n"); // 当前遍历指针
             if *width == 8 {
