@@ -33,17 +33,24 @@ pub fn generate(program: &Program) -> Result<String, String> {
             bytes
         );
     }
-    // 全局变量
+    // 全局变量:统一用 [N x i8] 字节镜像
     for g in &program.globals {
-        match (g.init, g.size) {
-            (Some(v), 8) => {
-                let _ = writeln!(out, "@{} = global i64 {}", g.name, v);
+        match &g.init {
+            Some(bytes) => {
+                let mut s = String::new();
+                for b in bytes {
+                    let _ = write!(s, "\\{:02X}", b);
+                }
+                let _ = writeln!(
+                    out,
+                    "@{} = global [{} x i8] c\"{}\"",
+                    g.name,
+                    bytes.len(),
+                    s
+                );
             }
-            (Some(v), _) => {
-                let _ = writeln!(out, "@{} = global i32 {}", g.name, v);
-            }
-            (None, n) => {
-                let _ = writeln!(out, "@{} = global [{} x i8] zeroinitializer", g.name, n.max(1));
+            None => {
+                let _ = writeln!(out, "@{} = global [{} x i8] zeroinitializer", g.name, g.size.max(1));
             }
         }
     }
@@ -327,6 +334,13 @@ fn gen_instr(instr: &Instr, rty: &str, g: &mut Gen) -> Result<(), String> {
             let v = g.load_i32(*src);
             let w = g.val();
             g.emit(&format!("{} = sext i32 {} to i64", w, v));
+            g.store_i64(*dst, &w);
+        }
+        Instr::WidenU { dst, src } => {
+            g.ensure_open();
+            let v = g.load_i32(*src);
+            let w = g.val();
+            g.emit(&format!("{} = zext i32 {} to i64", w, v));
             g.store_i64(*dst, &w);
         }
         Instr::IntToFloat { dst, src } => {
@@ -666,7 +680,16 @@ fn gen_instr(instr: &Instr, rty: &str, g: &mut Gen) -> Result<(), String> {
 fn is_cmp(op: BinOp) -> bool {
     matches!(
         op,
-        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::Eq | BinOp::Ne
+        BinOp::Lt
+            | BinOp::Gt
+            | BinOp::Le
+            | BinOp::Ge
+            | BinOp::Eq
+            | BinOp::Ne
+            | BinOp::ULt
+            | BinOp::UGt
+            | BinOp::ULe
+            | BinOp::UGe
     )
 }
 
@@ -685,6 +708,9 @@ fn int_binop(g: &mut Gen, op: BinOp, a: &str, b: &str, ty: &str) -> String {
         BinOp::BitXor => "xor",
         BinOp::Shl => "shl",
         BinOp::Shr => "ashr",
+        BinOp::UDiv => "udiv",
+        BinOp::UMod => "urem",
+        BinOp::UShr => "lshr",
         _ => unreachable!(),
     };
     let r = g.val();
@@ -700,6 +726,10 @@ fn int_cmp(g: &mut Gen, op: BinOp, a: &str, b: &str, ty: &str) -> String {
         BinOp::Ge => "sge",
         BinOp::Eq => "eq",
         BinOp::Ne => "ne",
+        BinOp::ULt => "ult",
+        BinOp::UGt => "ugt",
+        BinOp::ULe => "ule",
+        BinOp::UGe => "uge",
         _ => unreachable!(),
     };
     let c = g.val();

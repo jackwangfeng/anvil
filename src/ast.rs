@@ -8,11 +8,12 @@ pub struct Program {
     pub globals: Vec<Global>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Global {
     pub name: String,
     pub ty: Type,
-    pub init: Option<i64>,
+    /// 初始化器(常量表达式或聚合初始化列表);None 表示零初始化。
+    pub init: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

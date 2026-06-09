@@ -17,7 +17,16 @@ pub fn generate(program: &Program) -> String {
 fn is_compare_binop(op: &BinOp) -> bool {
     matches!(
         op,
-        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::Eq | BinOp::Ne
+        BinOp::Lt
+            | BinOp::Gt
+            | BinOp::Le
+            | BinOp::Ge
+            | BinOp::Eq
+            | BinOp::Ne
+            | BinOp::ULt
+            | BinOp::UGt
+            | BinOp::ULe
+            | BinOp::UGe
     )
 }
 
@@ -99,15 +108,19 @@ fn gen_globals(globals: &[crate::ir::GlobalVar], out: &mut String) {
         out.push('\n');
         out.push_str(".p2align 3\n");
         let _ = writeln!(out, "_{}:", g.name);
-        match (g.init, g.size) {
-            (Some(v), 8) => {
-                let _ = writeln!(out, "    .quad {}", v);
+        match &g.init {
+            Some(bytes) => {
+                out.push_str("    .byte ");
+                for (k, b) in bytes.iter().enumerate() {
+                    if k > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "{}", b);
+                }
+                out.push('\n');
             }
-            (Some(v), _) => {
-                let _ = writeln!(out, "    .long {}", v);
-            }
-            (None, n) => {
-                let _ = writeln!(out, "    .zero {}", n.max(1));
+            None => {
+                let _ = writeln!(out, "    .zero {}", g.size.max(1));
             }
         }
     }
@@ -545,6 +558,16 @@ fn gen_instr(
                 BinOp::BitXor => out.push_str("    eor w9, w9, w10\n"),
                 BinOp::Shl => out.push_str("    lsl w9, w9, w10\n"),
                 BinOp::Shr => out.push_str("    asr w9, w9, w10\n"),
+                BinOp::UDiv => out.push_str("    udiv w9, w9, w10\n"),
+                BinOp::UMod => {
+                    out.push_str("    udiv w11, w9, w10\n");
+                    out.push_str("    msub w9, w11, w10, w9\n");
+                }
+                BinOp::UShr => out.push_str("    lsr w9, w9, w10\n"),
+                BinOp::ULt => out.push_str("    cmp w9, w10\n    cset w9, lo\n"),
+                BinOp::UGt => out.push_str("    cmp w9, w10\n    cset w9, hi\n"),
+                BinOp::ULe => out.push_str("    cmp w9, w10\n    cset w9, ls\n"),
+                BinOp::UGe => out.push_str("    cmp w9, w10\n    cset w9, hs\n"),
             }
             let _ = writeln!(out, "    str w9, [sp, #{}]", slot(*dst));
         }
@@ -649,6 +672,16 @@ fn gen_instr(
                 BinOp::BitXor => out.push_str("    eor x9, x9, x10\n"),
                 BinOp::Shl => out.push_str("    lsl x9, x9, x10\n"),
                 BinOp::Shr => out.push_str("    asr x9, x9, x10\n"),
+                BinOp::UDiv => out.push_str("    udiv x9, x9, x10\n"),
+                BinOp::UMod => {
+                    out.push_str("    udiv x11, x9, x10\n");
+                    out.push_str("    msub x9, x11, x10, x9\n");
+                }
+                BinOp::UShr => out.push_str("    lsr x9, x9, x10\n"),
+                BinOp::ULt => out.push_str("    cmp x9, x10\n    cset w9, lo\n"),
+                BinOp::UGt => out.push_str("    cmp x9, x10\n    cset w9, hi\n"),
+                BinOp::ULe => out.push_str("    cmp x9, x10\n    cset w9, ls\n"),
+                BinOp::UGe => out.push_str("    cmp x9, x10\n    cset w9, hs\n"),
             }
             // 比较结果是 32 位 0/1（在 w9），算术结果是 64 位（在 x9）
             if is_compare_binop(op) {
@@ -666,6 +699,11 @@ fn gen_instr(
             // 符号扩展 32→64（int → long）
             let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*src));
             out.push_str("    sxtw x9, w9\n");
+            let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
+        }
+        Instr::WidenU { dst, src } => {
+            // 零扩展 32→64（unsigned int → ulong）:ldr w 自动清零高 32 位
+            let _ = writeln!(out, "    ldr w9, [sp, #{}]", slot(*src));
             let _ = writeln!(out, "    str x9, [sp, #{}]", slot(*dst));
         }
         Instr::LongToFloat { dst, src } => {

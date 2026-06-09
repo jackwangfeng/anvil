@@ -277,15 +277,19 @@ fn gen_globals(globals: &[crate::ir::GlobalVar], out: &mut String) {
         let _ = writeln!(out, ".globl {}", g.name);
         out.push_str(".p2align 3\n");
         let _ = writeln!(out, "{}:", g.name);
-        match (g.init, g.size) {
-            (Some(v), 8) => {
-                let _ = writeln!(out, "    .quad {}", v);
+        match &g.init {
+            Some(bytes) => {
+                out.push_str("    .byte ");
+                for (k, b) in bytes.iter().enumerate() {
+                    if k > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "{}", b);
+                }
+                out.push('\n');
             }
-            (Some(v), _) => {
-                let _ = writeln!(out, "    .long {}", v);
-            }
-            (None, n) => {
-                let _ = writeln!(out, "    .zero {}", n.max(1));
+            None => {
+                let _ = writeln!(out, "    .zero {}", g.size.max(1));
             }
         }
     }
@@ -559,6 +563,15 @@ fn gen_instr(
                 BinOp::BitXor => out.push_str("    xorl %ecx, %eax\n"),
                 BinOp::Shl => out.push_str("    shll %cl, %eax\n"),
                 BinOp::Shr => out.push_str("    sarl %cl, %eax\n"),
+                BinOp::UDiv => out.push_str("    xorl %edx, %edx\n    divl %ecx\n"),
+                BinOp::UMod => {
+                    out.push_str("    xorl %edx, %edx\n    divl %ecx\n    movl %edx, %eax\n")
+                }
+                BinOp::UShr => out.push_str("    shrl %cl, %eax\n"),
+                BinOp::ULt => out.push_str("    cmpl %ecx, %eax\n    setb %al\n    movzbl %al, %eax\n"),
+                BinOp::UGt => out.push_str("    cmpl %ecx, %eax\n    seta %al\n    movzbl %al, %eax\n"),
+                BinOp::ULe => out.push_str("    cmpl %ecx, %eax\n    setbe %al\n    movzbl %al, %eax\n"),
+                BinOp::UGe => out.push_str("    cmpl %ecx, %eax\n    setae %al\n    movzbl %al, %eax\n"),
             }
             let _ = writeln!(out, "    movl %eax, {}", m(*dst));
         }
@@ -655,6 +668,15 @@ fn gen_instr(
                 BinOp::BitXor => out.push_str("    xorq %rcx, %rax\n"),
                 BinOp::Shl => out.push_str("    salq %cl, %rax\n"),
                 BinOp::Shr => out.push_str("    sarq %cl, %rax\n"),
+                BinOp::UDiv => out.push_str("    xorl %edx, %edx\n    divq %rcx\n"),
+                BinOp::UMod => {
+                    out.push_str("    xorl %edx, %edx\n    divq %rcx\n    movq %rdx, %rax\n")
+                }
+                BinOp::UShr => out.push_str("    shrq %cl, %rax\n"),
+                BinOp::ULt => out.push_str("    cmpq %rcx, %rax\n    setb %al\n    movzbl %al, %eax\n"),
+                BinOp::UGt => out.push_str("    cmpq %rcx, %rax\n    seta %al\n    movzbl %al, %eax\n"),
+                BinOp::ULe => out.push_str("    cmpq %rcx, %rax\n    setbe %al\n    movzbl %al, %eax\n"),
+                BinOp::UGe => out.push_str("    cmpq %rcx, %rax\n    setae %al\n    movzbl %al, %eax\n"),
             }
             // 比较结果是 32 位 0/1（已在 eax），算术结果是 64 位（在 rax）
             if is_compare_binop(op) {
@@ -671,6 +693,11 @@ fn gen_instr(
         Instr::Widen { dst, src } => {
             // 符号扩展 32→64（int → long）
             let _ = writeln!(out, "    movslq {}, %rax", m(*src));
+            let _ = writeln!(out, "    movq %rax, {}", m(*dst));
+        }
+        Instr::WidenU { dst, src } => {
+            // 零扩展 32→64（unsigned int → ulong）:movl 自动清零高 32 位
+            let _ = writeln!(out, "    movl {}, %eax", m(*src));
             let _ = writeln!(out, "    movq %rax, {}", m(*dst));
         }
         Instr::LongToFloat { dst, src } => {
@@ -703,7 +730,16 @@ fn scale_index(size: usize, out: &mut String) {
 fn is_compare_binop(op: &BinOp) -> bool {
     matches!(
         op,
-        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::Eq | BinOp::Ne
+        BinOp::Lt
+            | BinOp::Gt
+            | BinOp::Le
+            | BinOp::Ge
+            | BinOp::Eq
+            | BinOp::Ne
+            | BinOp::ULt
+            | BinOp::UGt
+            | BinOp::ULe
+            | BinOp::UGe
     )
 }
 

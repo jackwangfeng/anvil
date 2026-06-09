@@ -17,7 +17,8 @@ pub struct Program {
 pub struct GlobalVar {
     pub name: String,
     pub size: usize,
-    pub init: Option<i64>,
+    /// 初始化字节镜像(小端);None 表示零初始化。
+    pub init: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,8 +117,13 @@ pub enum Instr {
         dst: Temp,
         src: Temp,
     },
-    /// 符号扩展 32→64（int → long）。
+    /// 符号扩展 32→64（有符号 int → long）。
     Widen {
+        dst: Temp,
+        src: Temp,
+    },
+    /// 零扩展 32→64（无符号 int → long）。
+    WidenU {
         dst: Temp,
         src: Temp,
     },
@@ -166,6 +172,14 @@ pub enum BinOp {
     BitXor,
     Shl,
     Shr,
+    // 无符号变体(仅这些运算与有符号不同)
+    UDiv,
+    UMod,
+    UShr, // 逻辑右移
+    ULt,
+    UGt,
+    ULe,
+    UGe,
 }
 
 pub fn lower(ast: &AstProgram) -> Program {
@@ -197,10 +211,16 @@ pub fn lower(ast: &AstProgram) -> Program {
     let globals = ast
         .globals
         .iter()
-        .map(|g| GlobalVar {
-            name: g.name.clone(),
-            size: crate::types::size_of(&g.ty, &ast.aggregates),
-            init: g.init,
+        .map(|g| {
+            let size = crate::types::size_of(&g.ty, &ast.aggregates);
+            GlobalVar {
+                name: g.name.clone(),
+                size,
+                init: g
+                    .init
+                    .as_ref()
+                    .map(|e| eval_init_bytes(&g.ty, e, &ast.aggregates, size)),
+            }
         })
         .collect();
     Program {
@@ -400,9 +420,16 @@ impl<'a> Lowerer<'a> {
             (Float, Wide) => Instr::FloatToLong { dst, src: t },
             (Narrow, Float) => Instr::IntToFloat { dst, src: t },
             (Wide, Float) => Instr::LongToFloat { dst, src: t },
-            (Narrow, Wide) => Instr::Widen { dst, src: t }, // 符号扩展 32→64
-            (Wide, Narrow) => return t,                     // 截断：取低 32 位，无需指令
-            _ => return t,                                  // void/struct 等不转换
+            // 32→64 扩展:无符号源零扩展,有符号源符号扩展
+            (Narrow, Wide) => {
+                if from.is_unsigned() {
+                    Instr::WidenU { dst, src: t }
+                } else {
+                    Instr::Widen { dst, src: t }
+                }
+            }
+            (Wide, Narrow) => return t, // 截断：取低 32 位，无需指令
+            _ => return t,              // void/struct 等不转换
         };
         self.body.push(instr);
         dst
@@ -475,7 +502,11 @@ impl<'a> Lowerer<'a> {
                         self.body.push(Instr::Return {
                             src,
                             is_float: matches!(ret_ty, Type::Double),
-                            width: if matches!(ret_ty, Type::Pointer(_) | Type::Long) { 8 } else { 4 },
+                            width: if matches!(ret_ty, Type::Pointer(_) | Type::Long | Type::ULong) {
+                                8
+                            } else {
+                                4
+                            },
                             agg: None,
                         });
                     }
@@ -1031,7 +1062,10 @@ impl<'a> Lowerer<'a> {
             _ => None,
         };
         let ret_width =
-            if matches!(ret, Type::Pointer(_) | Type::Double | Type::Long | Type::FnPtr(_)) {
+            if matches!(
+                ret,
+                Type::Pointer(_) | Type::Double | Type::Long | Type::ULong | Type::FnPtr(_)
+            ) {
                 8
             } else {
                 4
@@ -1196,28 +1230,32 @@ impl<'a> Lowerer<'a> {
             };
             return (dst, result_ty);
         }
-        // 64 位整数运算：任一操作数为 long 即走 64 位路径（int 操作数符号扩展提升）
-        if matches!(lty, Type::Long) || matches!(rty, Type::Long) {
-            let ll = self.coerce(l, &lty, &Type::Long);
-            let rr = self.coerce(r, &rty, &Type::Long);
+        // 任一操作数无符号 → 整个运算走无符号语义(C 的通常算术转换简化:无符号优先)
+        let uns = lty.is_unsigned() || rty.is_unsigned();
+        // 64 位整数运算：任一操作数为 long/ulong 即走 64 位路径
+        if matches!(lty, Type::Long | Type::ULong) || matches!(rty, Type::Long | Type::ULong) {
+            let common = if uns { Type::ULong } else { Type::Long };
+            let ll = self.coerce(l, &lty, &common);
+            let rr = self.coerce(r, &rty, &common);
             let dst = self.fresh();
             self.body.push(Instr::BinL {
                 dst,
-                op: lower_binop(op),
+                op: lower_binop_u(op, uns),
                 lhs: ll,
                 rhs: rr,
             });
-            let result_ty = if is_compare(op) { Type::Int } else { Type::Long };
+            let result_ty = if is_compare(op) { Type::Int } else { common };
             return (dst, result_ty);
         }
         let dst = self.fresh();
         self.body.push(Instr::Bin {
             dst,
-            op: lower_binop(op),
+            op: lower_binop_u(op, uns),
             lhs: l,
             rhs: r,
         });
-        (dst, Type::Int)
+        let result_ty = if is_compare(op) || !uns { Type::Int } else { Type::UInt };
+        (dst, result_ty)
     }
 
     /// 仅推断类型（用于 sizeof / 三元公共类型，不求值操作数）。
@@ -1338,8 +1376,10 @@ enum NumKind {
 
 fn num_kind(ty: &Type) -> NumKind {
     match ty {
-        Type::Int | Type::Char => NumKind::Narrow,
-        Type::Long | Type::Pointer(_) | Type::Array(..) | Type::FnPtr(_) => NumKind::Wide,
+        Type::Int | Type::Char | Type::UInt | Type::UChar => NumKind::Narrow,
+        Type::Long | Type::ULong | Type::Pointer(_) | Type::Array(..) | Type::FnPtr(_) => {
+            NumKind::Wide
+        }
         Type::Double => NumKind::Float,
         _ => NumKind::Other,
     }
@@ -1360,6 +1400,98 @@ fn common_type(a: &Type, b: &Type) -> Type {
             }
         }
         _ => Type::Int,
+    }
+}
+
+/// 64 位常量整数求值(用于全局初始化器)。支持字面量/一元/二元算术与位运算。
+fn const_i64(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::IntLit(v) => Some(*v),
+        Expr::Cast { expr, .. } => const_i64(expr),
+        Expr::Unary { op, operand } => {
+            let v = const_i64(operand)?;
+            Some(match op {
+                UnaryOp::Neg => v.wrapping_neg(),
+                UnaryOp::Plus => v,
+            })
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let a = const_i64(lhs)?;
+            let b = const_i64(rhs)?;
+            Some(match op {
+                BinaryOp::Add => a.wrapping_add(b),
+                BinaryOp::Sub => a.wrapping_sub(b),
+                BinaryOp::Mul => a.wrapping_mul(b),
+                BinaryOp::Div => {
+                    if b == 0 {
+                        return None;
+                    }
+                    a.wrapping_div(b)
+                }
+                BinaryOp::Mod => {
+                    if b == 0 {
+                        return None;
+                    }
+                    a.wrapping_rem(b)
+                }
+                BinaryOp::BitAnd => a & b,
+                BinaryOp::BitOr => a | b,
+                BinaryOp::BitXor => a ^ b,
+                BinaryOp::Shl => a.wrapping_shl(b as u32),
+                BinaryOp::Shr => a.wrapping_shr(b as u32),
+                BinaryOp::Lt => (a < b) as i64,
+                BinaryOp::Gt => (a > b) as i64,
+                BinaryOp::Le => (a <= b) as i64,
+                BinaryOp::Ge => (a >= b) as i64,
+                BinaryOp::Eq => (a == b) as i64,
+                BinaryOp::Ne => (a != b) as i64,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 计算全局初始化器的字节镜像(小端,长度 = size_of(ty))。
+fn eval_init_bytes(ty: &Type, e: &Expr, aggs: &Aggregates, size: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; size];
+    write_init(&mut buf, 0, ty, e, aggs);
+    buf
+}
+
+fn write_init(buf: &mut [u8], off: usize, ty: &Type, e: &Expr, aggs: &Aggregates) {
+    match ty {
+        Type::Array(elem, n) => {
+            if let Expr::InitList(items) = e {
+                let esz = crate::types::size_of(elem, aggs);
+                for (i, it) in items.iter().enumerate().take(*n) {
+                    write_init(buf, off + i * esz, elem, it, aggs);
+                }
+            }
+        }
+        Type::Struct(name) | Type::Union(name) => {
+            if let Expr::InitList(items) = e {
+                if let Some(agg) = aggs.get(name) {
+                    let fields = agg.fields.clone();
+                    for (i, f) in fields.iter().enumerate() {
+                        if let Some(it) = items.get(i) {
+                            write_init(buf, off + f.offset, &f.ty, it, aggs);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            // 标量:取常量整数(若是 {expr} 取首项),写小端 width 字节
+            let scalar = match e {
+                Expr::InitList(items) => items.first(),
+                other => Some(other),
+            };
+            let v = scalar.and_then(const_i64).unwrap_or(0);
+            let w = crate::types::size_of(ty, aggs);
+            for k in 0..w.min(buf.len() - off) {
+                buf[off + k] = ((v >> (k * 8)) & 0xff) as u8;
+            }
+        }
     }
 }
 
@@ -1437,6 +1569,23 @@ fn lower_binop(op: BinaryOp) -> BinOp {
         BinaryOp::BitXor => BinOp::BitXor,
         BinaryOp::Shl => BinOp::Shl,
         BinaryOp::Shr => BinOp::Shr,
+    }
+}
+
+/// 同 lower_binop,但 `uns` 为真时把除/模/右移/有序比较换成无符号变体。
+fn lower_binop_u(op: BinaryOp, uns: bool) -> BinOp {
+    if !uns {
+        return lower_binop(op);
+    }
+    match op {
+        BinaryOp::Div => BinOp::UDiv,
+        BinaryOp::Mod => BinOp::UMod,
+        BinaryOp::Shr => BinOp::UShr,
+        BinaryOp::Lt => BinOp::ULt,
+        BinaryOp::Gt => BinOp::UGt,
+        BinaryOp::Le => BinOp::ULe,
+        BinaryOp::Ge => BinOp::UGe,
+        other => lower_binop(other), // 其余运算有/无符号相同
     }
 }
 

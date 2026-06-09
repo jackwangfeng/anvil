@@ -1107,3 +1107,104 @@ fn m21_llvm_varargs_double() {
     let src = "#include <stdio.h>\ndouble favg(int n, ...){ va_list ap; va_start(ap,n); double s=0; for(int i=0;i<n;i++) s+=va_arg(ap,double); va_end(ap); return s/n; } int main(){ printf(\"%f\\n\", favg(4, 2.0,4.0,6.0,8.0)); return 0; }";
     cross_check(src, "m21_va_d");
 }
+
+// ---- M23: 全局聚合初始化 ----
+
+#[test]
+fn m23_global_array_init() {
+    let src = "int a[] = {2,3,5,7,11}; int main(){ int s=0; for(int i=0;i<5;i++) s+=a[i]; return s; }"; // 28
+    assert_eq!(compile_and_run(src, "m23_garr"), 28);
+}
+
+#[test]
+fn m23_global_array_partial_zerofill() {
+    let src = "int a[5] = {10, 20}; int main(){ return a[0]+a[1]+a[2]+a[3]+a[4]; }"; // 30
+    assert_eq!(compile_and_run(src, "m23_gpart"), 30);
+}
+
+#[test]
+fn m23_global_struct_array() {
+    let src = "struct P{int x;int y;}; struct P t[3] = {{1,2},{3,4},{5,6}}; int main(){ return t[0].x + t[1].y + t[2].x; }"; // 1+4+5=10
+    assert_eq!(compile_and_run(src, "m23_gsa"), 10);
+}
+
+#[test]
+fn m23_global_long_array() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nlong b[2] = {10000000000, 5}; int main(){ printf(\"%ld\\n\", b[0] + b[1]); return 0; }",
+        "m23_glong",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "10000000005\n");
+}
+
+#[test]
+fn m23_global_init_cross_check() {
+    // 原生 vs LLVM 一致
+    cross_check(
+        "int tab[6] = {1,2,4,8,16,32}; struct P{int a;int b;}; struct P ps[2]={{7,8},{9,10}}; int main(){ int s=0; for(int i=0;i<6;i++) s+=tab[i]; return s + ps[0].a + ps[1].b; }",
+        "m23_gcc",
+    );
+}
+
+// ---- M24: unsigned 语义 ----
+
+#[test]
+fn m24_unsigned_division() {
+    // 4000000000 / 3:无符号除 = 1333333333(有符号会因 4e9 溢出 i32 而不同)
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ unsigned int a = 4000000000; printf(\"%u\\n\", a / 3); return 0; }",
+        "m24_udiv",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "1333333333\n");
+}
+
+#[test]
+fn m24_unsigned_comparison() {
+    // big = 0xFFFFFFFF;无符号 big>1 为真;有符号(=-1)则为假
+    let src = "int main(){ unsigned int big = 0xFFFFFFFF; return big > 1; }";
+    assert_eq!(compile_and_run(src, "m24_ucmp"), 1);
+}
+
+#[test]
+fn m24_unsigned_right_shift_logical() {
+    // 0x80000000u >> 4 = 0x08000000(逻辑);算术右移会是 0xF8000000
+    let src = "int main(){ unsigned int x = 0x80000000; return (x >> 4) == 0x08000000; }";
+    assert_eq!(compile_and_run(src, "m24_ushr"), 1);
+}
+
+#[test]
+fn m24_unsigned_char_zero_extends() {
+    // unsigned char 200 → 200(非 -56)
+    let src = "int main(){ unsigned char c = 200; int v = c; return v; }";
+    assert_eq!(compile_and_run(src, "m24_uchar"), 200);
+}
+
+#[test]
+fn m24_unsigned_cross_check() {
+    cross_check(
+        "#include <stdio.h>\nint main(){ unsigned int a=4000000000, b=7; unsigned long c=18000000000; printf(\"%u %u %d %lu\\n\", a/b, a%b, (a>100), c+1); return (a>100)+((a>>1)==2000000000); }",
+        "m24_ucc",
+    );
+}
+
+// ---- M24: char 8 位截断(回归;现有 width=1 存取已正确) ----
+
+#[test]
+fn m24_char_truncation_and_sign() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ char c=200; signed char s=130; char of=100+100; unsigned char u=200; printf(\"%d %d %d %d\\n\", c, s, of, u); return 0; }",
+        "m24_char",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "-56 -126 -56 200\n"); // signed char 截断/符号扩展;unsigned char 零扩展
+}
+
+#[test]
+fn m24_char_cross_check() {
+    cross_check(
+        "#include <stdio.h>\nint main(){ char c=200; unsigned char u=200; char w='A'+256; printf(\"%d %d %d\\n\", c, u, w); return 0; }",
+        "m24_char_cc",
+    );
+}
