@@ -33,6 +33,8 @@ pub enum Stmt {
         init: Option<Expr>,
     },
     ExprStmt(Expr),
+    /// 单条多声明符（如 `int a, b;`）——在当前作用域顺序展开，不引入新作用域。
+    Decls(Vec<Stmt>),
     Block(Vec<Stmt>),
     If {
         cond: Expr,
@@ -42,6 +44,10 @@ pub enum Stmt {
     While {
         cond: Expr,
         body: Box<Stmt>,
+    },
+    DoWhile {
+        body: Box<Stmt>,
+        cond: Expr,
     },
     For {
         init: Option<Box<Stmt>>,
@@ -97,6 +103,16 @@ pub enum Expr {
     },
     SizeofType(Type),
     SizeofExpr(Box<Expr>),
+    /// 强制类型转换 `(ty)expr`。
+    Cast {
+        ty: Type,
+        expr: Box<Expr>,
+    },
+    /// 逗号运算符 `first, second`：求值 first（丢弃），结果为 second。
+    Comma {
+        first: Box<Expr>,
+        second: Box<Expr>,
+    },
     Unary {
         op: UnaryOp,
         operand: Box<Expr>,

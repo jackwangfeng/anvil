@@ -613,3 +613,167 @@ fn m12_struct_roundtrip() {
     let src = "struct P { int x; int y; }; struct P make(int a,int b){ struct P p; p.x=a; p.y=b; return p; } int sum(struct P p){ return p.x+p.y; }\nint main(){ return sum(make(40, 2)); }";
     assert_eq!(compile_and_run(src, "m12_s_rt"), 42);
 }
+
+// ---- M13: long（64 位整数）+ (type)expr 强制类型转换 ----
+
+#[test]
+fn m13_long_arithmetic_64bit() {
+    // 10^6 * 10^6 = 10^12，远超 32 位
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ long x = 1000000; long y = x * x; printf(\"%ld\\n\", y); return 0; }",
+        "m13_long_arith",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "1000000000000\n");
+}
+
+#[test]
+fn m13_long_param_and_return() {
+    // 形参与返回值都是 64 位
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nlong mul(long a, long b){ return a * b; }\nint main(){ printf(\"%ld\\n\", mul(3000000000, 3)); return 0; }",
+        "m13_long_pr",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "9000000000\n");
+}
+
+#[test]
+fn m13_long_global_accumulate() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nlong total = 0;\nint main(){ int i; for (i = 0; i < 5; i++) total = total + 1000000000; printf(\"%ld\\n\", total); return 0; }",
+        "m13_long_glob",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "5000000000\n");
+}
+
+#[test]
+fn m13_long_recursion_factorial() {
+    // 20! 需要 64 位；三元分支 int : long 取公共类型 long
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nlong fact(int n){ return n <= 1 ? 1 : n * (long)fact(n-1); }\nint main(){ printf(\"%ld\\n\", fact(20)); return 0; }",
+        "m13_long_fact",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "2432902008176640000\n");
+}
+
+#[test]
+fn m13_long_comparison() {
+    // 5e9 > 4e9 的 64 位比较
+    let src = "int main(){ long a = 5000000000; long b = 4000000000; return a > b; }";
+    assert_eq!(compile_and_run(src, "m13_long_cmp"), 1);
+}
+
+#[test]
+fn m13_cast_double_to_int_truncates() {
+    let src = "int main(){ double d = 7.9; int n = (int)d; return n; }";
+    assert_eq!(compile_and_run(src, "m13_cast_d2i"), 7);
+}
+
+#[test]
+fn m13_cast_int_to_double_in_expr() {
+    // (double)7 / 2 = 3.5（若按 int 除则为 3）
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ int x = 7; printf(\"%f\\n\", (double)x / 2); return 0; }",
+        "m13_cast_i2d",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "3.500000\n");
+}
+
+#[test]
+fn m13_cast_int_to_long_widens() {
+    // (long)大int 相乘不溢出
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ int x = 100000; long y = (long)x * x; printf(\"%ld\\n\", y); return 0; }",
+        "m13_cast_i2l",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "10000000000\n");
+}
+
+// ---- M14: do-while 循环 + 逗号运算符 ----
+
+#[test]
+fn m14_do_while_basic() {
+    // do 体至少执行一次，再判条件：0+1+2+3+4 = 10
+    let src = "int main(){ int i = 0; int sum = 0; do { sum = sum + i; i++; } while (i < 5); return sum; }";
+    assert_eq!(compile_and_run(src, "m14_dw"), 10);
+}
+
+#[test]
+fn m14_do_while_runs_once_when_false() {
+    // 条件起始即假，do 体仍执行一次
+    let src = "int main(){ int n = 0; do { n++; } while (0); return n; }";
+    assert_eq!(compile_and_run(src, "m14_dw_once"), 1);
+}
+
+#[test]
+fn m14_do_while_break_continue() {
+    let src = "int main(){ int k = 0; do { k++; if (k == 3) break; } while (k < 100); return k; }";
+    assert_eq!(compile_and_run(src, "m14_dw_bc"), 3);
+}
+
+#[test]
+fn m14_comma_operator_value() {
+    // (b = 3, b * 2) 求值为 6
+    let src = "int main(){ int b; int a = (b = 3, b * 2); return a; }";
+    assert_eq!(compile_and_run(src, "m14_comma"), 6);
+}
+
+#[test]
+fn m14_comma_in_for_clauses() {
+    // for 的 init/step 用逗号运算符同时推进两个变量，相遇于 5
+    let src = "int main(){ int i; int j; int n = 0; for (i = 0, j = 10; i < j; i++, j--) n++; return n; }";
+    assert_eq!(compile_and_run(src, "m14_comma_for"), 5);
+}
+
+// ---- M15: 单条声明多个变量 ----
+
+#[test]
+fn m15_multi_declarator_with_init() {
+    let src = "int main(){ int a = 1, b = 2, c = 3; return a + b + c; }";
+    assert_eq!(compile_and_run(src, "m15_md_init"), 6);
+}
+
+#[test]
+fn m15_multi_declarator_no_init() {
+    let src = "int main(){ int x, y; x = 4; y = 5; return x + y; }";
+    assert_eq!(compile_and_run(src, "m15_md_noinit"), 9);
+}
+
+#[test]
+fn m15_pointer_binds_per_declarator() {
+    // `int *p, q;` → p 是 int*，q 是 int；通过 p 改 q
+    let src = "int main(){ int q; int *p, r; p = &q; *p = 42; r = q; return r; }";
+    assert_eq!(compile_and_run(src, "m15_md_ptr"), 42);
+}
+
+#[test]
+fn m15_multi_declarator_array_and_scalar() {
+    let src = "int main(){ int arr[3], n; arr[0]=10; arr[1]=20; arr[2]=30; n = arr[0]+arr[1]+arr[2]; return n; }";
+    assert_eq!(compile_and_run(src, "m15_md_arr"), 60);
+}
+
+#[test]
+fn m15_long_multi_declarator() {
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint main(){ long a = 3000000000, b = 3000000000; printf(\"%ld\\n\", a + b); return 0; }",
+        "m15_md_long",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "6000000000\n");
+}
+
+#[test]
+fn m15_global_multi_declarator() {
+    // 全局单条多声明符（含 long 与指针绑定）
+    let (code, out) = compile_run_capture(
+        "#include <stdio.h>\nint a, b = 5, c = 10;\nlong big = 3000000000;\nint main(){ a = 1; printf(\"%d %d %d %ld\\n\", a, b, c, big); return b + c; }",
+        "m15_global_md",
+    );
+    assert_eq!(code, 15);
+    assert_eq!(out, "1 5 10 3000000000\n");
+}

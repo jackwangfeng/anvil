@@ -203,7 +203,13 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, 
     let m = |t: usize| loc(t, frame);
     match instr {
         Instr::Const { dst, value } => {
-            let _ = writeln!(out, "    movl ${}, {}", *value as i32, m(*dst));
+            if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 {
+                let _ = writeln!(out, "    movl ${}, {}", *value as i32, m(*dst));
+            } else {
+                // 超 32 位字面量（long）：64 位物化，写满 8 字节
+                let _ = writeln!(out, "    movabsq ${}, %rax", value);
+                let _ = writeln!(out, "    movq %rax, {}", m(*dst));
+            }
         }
         Instr::Neg { dst, src } => {
             let _ = writeln!(out, "    movl {}, %eax", m(*src));
@@ -490,6 +496,55 @@ fn gen_instr(instr: &Instr, func: &str, frame: usize, sret_slot: Option<usize>, 
             let _ = writeln!(out, "    movsd {}, %xmm0", m(*src));
             out.push_str("    cvttsd2si %xmm0, %eax\n");
             let _ = writeln!(out, "    movl %eax, {}", m(*dst));
+        }
+        Instr::BinL { dst, op, lhs, rhs } => {
+            // 64 位有符号整数运算
+            let _ = writeln!(out, "    movq {}, %rax", m(*lhs));
+            let _ = writeln!(out, "    movq {}, %rcx", m(*rhs));
+            match op {
+                BinOp::Add => out.push_str("    addq %rcx, %rax\n"),
+                BinOp::Sub => out.push_str("    subq %rcx, %rax\n"),
+                BinOp::Mul => out.push_str("    imulq %rcx, %rax\n"),
+                BinOp::Div => out.push_str("    cqto\n    idivq %rcx\n"),
+                BinOp::Mod => out.push_str("    cqto\n    idivq %rcx\n    movq %rdx, %rax\n"),
+                BinOp::Lt => out.push_str("    cmpq %rcx, %rax\n    setl %al\n    movzbl %al, %eax\n"),
+                BinOp::Gt => out.push_str("    cmpq %rcx, %rax\n    setg %al\n    movzbl %al, %eax\n"),
+                BinOp::Le => out.push_str("    cmpq %rcx, %rax\n    setle %al\n    movzbl %al, %eax\n"),
+                BinOp::Ge => out.push_str("    cmpq %rcx, %rax\n    setge %al\n    movzbl %al, %eax\n"),
+                BinOp::Eq => out.push_str("    cmpq %rcx, %rax\n    sete %al\n    movzbl %al, %eax\n"),
+                BinOp::Ne => out.push_str("    cmpq %rcx, %rax\n    setne %al\n    movzbl %al, %eax\n"),
+                BinOp::BitAnd => out.push_str("    andq %rcx, %rax\n"),
+                BinOp::BitOr => out.push_str("    orq %rcx, %rax\n"),
+                BinOp::BitXor => out.push_str("    xorq %rcx, %rax\n"),
+                BinOp::Shl => out.push_str("    salq %cl, %rax\n"),
+                BinOp::Shr => out.push_str("    sarq %cl, %rax\n"),
+            }
+            // 比较结果是 32 位 0/1（已在 eax），算术结果是 64 位（在 rax）
+            if is_compare_binop(op) {
+                let _ = writeln!(out, "    movl %eax, {}", m(*dst));
+            } else {
+                let _ = writeln!(out, "    movq %rax, {}", m(*dst));
+            }
+        }
+        Instr::NegL { dst, src } => {
+            let _ = writeln!(out, "    movq {}, %rax", m(*src));
+            out.push_str("    negq %rax\n");
+            let _ = writeln!(out, "    movq %rax, {}", m(*dst));
+        }
+        Instr::Widen { dst, src } => {
+            // 符号扩展 32→64（int → long）
+            let _ = writeln!(out, "    movslq {}, %rax", m(*src));
+            let _ = writeln!(out, "    movq %rax, {}", m(*dst));
+        }
+        Instr::LongToFloat { dst, src } => {
+            let _ = writeln!(out, "    movq {}, %rax", m(*src));
+            out.push_str("    cvtsi2sdq %rax, %xmm0\n");
+            let _ = writeln!(out, "    movsd %xmm0, {}", m(*dst));
+        }
+        Instr::FloatToLong { dst, src } => {
+            let _ = writeln!(out, "    movsd {}, %xmm0", m(*src));
+            out.push_str("    cvttsd2siq %xmm0, %rax\n");
+            let _ = writeln!(out, "    movq %rax, {}", m(*dst));
         }
     }
 }
