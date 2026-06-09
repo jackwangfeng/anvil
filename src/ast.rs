@@ -57,6 +57,10 @@ pub enum Stmt {
     },
     Break,
     Continue,
+    /// `goto label;`
+    Goto(String),
+    /// `label:`（标签,标识跳转目标）
+    Label(String),
     Switch {
         cond: Expr,
         body: Vec<Stmt>,
@@ -113,6 +117,8 @@ pub enum Expr {
         first: Box<Expr>,
         second: Box<Expr>,
     },
+    /// 聚合初始化列表 `{a, b, c}`（用于数组/结构体初始化，可嵌套）。
+    InitList(Vec<Expr>),
     Unary {
         op: UnaryOp,
         operand: Box<Expr>,

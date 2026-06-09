@@ -317,15 +317,45 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     i += 1;
                     col += 1;
                 }
-                // 浮点字面量：小数点后跟数字
-                if i + 1 < chars.len() && chars[i] == '.' && chars[i + 1].is_ascii_digit() {
-                    num.push('.');
-                    i += 1;
-                    col += 1;
-                    while i < chars.len() && chars[i].is_ascii_digit() {
-                        num.push(chars[i]);
+                // 浮点字面量：小数点后跟数字（1.5），或指数（1e10 / 1.5e-3 / 2E8）
+                let has_frac =
+                    i + 1 < chars.len() && chars[i] == '.' && chars[i + 1].is_ascii_digit();
+                let has_exp = i < chars.len()
+                    && matches!(chars[i], 'e' | 'E')
+                    && {
+                        let mut j = i + 1;
+                        if j < chars.len() && matches!(chars[j], '+' | '-') {
+                            j += 1;
+                        }
+                        j < chars.len() && chars[j].is_ascii_digit()
+                    };
+                if has_frac || has_exp {
+                    // 小数部分
+                    if has_frac {
+                        num.push('.');
                         i += 1;
                         col += 1;
+                        while i < chars.len() && chars[i].is_ascii_digit() {
+                            num.push(chars[i]);
+                            i += 1;
+                            col += 1;
+                        }
+                    }
+                    // 指数部分 e[+/-]digits
+                    if i < chars.len() && matches!(chars[i], 'e' | 'E') {
+                        num.push('e');
+                        i += 1;
+                        col += 1;
+                        if i < chars.len() && matches!(chars[i], '+' | '-') {
+                            num.push(chars[i]);
+                            i += 1;
+                            col += 1;
+                        }
+                        while i < chars.len() && chars[i].is_ascii_digit() {
+                            num.push(chars[i]);
+                            i += 1;
+                            col += 1;
+                        }
                     }
                     let value: f64 = num.parse().map_err(|_| {
                         CompileError::new(
@@ -338,12 +368,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                         span: Span::new(line, start_col),
                     });
                 } else {
-                    let value: i64 = num.parse().map_err(|_| {
-                        CompileError::new(
-                            Span::new(line, start_col),
-                            format!("invalid integer literal '{}'", num),
-                        )
-                    })?;
+                    // 前导 0 且不止一位 → 八进制（如 0777）；否则十进制
+                    let value: i64 = if num.len() > 1 && num.starts_with('0') {
+                        i64::from_str_radix(&num[1..], 8).map_err(|_| {
+                            CompileError::new(
+                                Span::new(line, start_col),
+                                format!("invalid octal literal '{}'", num),
+                            )
+                        })?
+                    } else {
+                        num.parse().map_err(|_| {
+                            CompileError::new(
+                                Span::new(line, start_col),
+                                format!("invalid integer literal '{}'", num),
+                            )
+                        })?
+                    };
                     // 消费整数后缀 L/U（不影响数值，仅避免被当作标识符）
                     while i < chars.len() && matches!(chars[i], 'l' | 'L' | 'u' | 'U') {
                         i += 1;
@@ -370,6 +410,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     "else" => TokenKind::KwElse,
                     "while" => TokenKind::KwWhile,
                     "do" => TokenKind::KwDo,
+                    "goto" => TokenKind::KwGoto,
+                    "static" => TokenKind::KwStatic,
+                    "extern" => TokenKind::KwExtern,
+                    "register" => TokenKind::KwRegister,
+                    "auto" => TokenKind::KwAuto,
                     "for" => TokenKind::KwFor,
                     "char" => TokenKind::KwChar,
                     "sizeof" => TokenKind::KwSizeof,
@@ -386,6 +431,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     "default" => TokenKind::KwDefault,
                     "double" | "float" => TokenKind::KwDouble,
                     "long" => TokenKind::KwLong,
+                    "short" => TokenKind::KwShort,
+                    "unsigned" => TokenKind::KwUnsigned,
+                    "signed" => TokenKind::KwSigned,
                     _ => TokenKind::Ident(ident),
                 };
                 tokens.push(Token { kind, span: Span::new(line, start_col) });
