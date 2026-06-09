@@ -67,7 +67,7 @@ impl<'a> Parser<'a> {
         let mut functions = Vec::new();
         while *self.peek_kind() != TokenKind::Eof {
             match self.peek_kind() {
-                TokenKind::KwStruct | TokenKind::KwUnion => {
+                TokenKind::KwStruct | TokenKind::KwUnion if self.is_aggregate_def() => {
                     self.parse_aggregate_def()?;
                     self.expect(&TokenKind::Semicolon)?;
                 }
@@ -95,6 +95,19 @@ impl<'a> Parser<'a> {
 
     fn size_of(&self, ty: &Type) -> usize {
         crate::types::size_of(ty, &self.aggregates)
+    }
+
+    /// 当前 `struct`/`union` 是否引出一个聚合体定义（`struct [Tag] { ... }`），
+    /// 而非把已知聚合体当作返回类型/变量类型用（`struct Tag name ...`）。
+    fn is_aggregate_def(&self) -> bool {
+        match self.tokens.get(self.pos + 1).map(|t| &t.kind) {
+            Some(TokenKind::LBrace) => true,
+            Some(TokenKind::Ident(_)) => matches!(
+                self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                Some(TokenKind::LBrace)
+            ),
+            _ => false,
+        }
     }
 
     fn at_type_start(&self) -> bool {
@@ -364,6 +377,7 @@ impl<'a> Parser<'a> {
             name.clone(),
             Signature {
                 ret: ret.clone(),
+                params: params.iter().map(|(_, t)| t.clone()).collect(),
                 fixed: params.len(),
                 variadic,
             },

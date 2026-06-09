@@ -68,6 +68,8 @@ pub type Aggregates = HashMap<String, Aggregate>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature {
     pub ret: Type,
+    /// 固定形参类型（不含可变参数部分）。
+    pub params: Vec<Type>,
     pub fixed: usize,
     pub variadic: bool,
 }

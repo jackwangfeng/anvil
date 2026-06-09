@@ -23,8 +23,29 @@ pub struct GlobalVar {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Function {
     pub name: String,
+    /// 形参（按声明顺序）。调用约定由各后端据此在序言里把寄存器/栈实参落到 `slot`。
+    pub params: Vec<Param>,
     pub body: Vec<Instr>,
     pub frame_bytes: usize,
+    /// 返回类型是否为 double（→ 浮点返回寄存器）。
+    pub ret_float: bool,
+    /// 返回的聚合体（struct/union 按值返回）字节大小；标量/指针为 `None`。
+    pub ret_agg: Option<usize>,
+    /// 返回大结构体（>16 字节）时，序言保存隐式返回指针的帧内槽位。
+    pub sret_slot: Option<usize>,
+}
+
+/// 一个形参在帧内的落点描述（目标无关）。各后端按自身 ABI 决定它来自哪个寄存器或栈位。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Param {
+    /// 帧内字节偏移（变量存放位置）。
+    pub slot: usize,
+    /// 字节大小（结构体可 >8）。
+    pub size: usize,
+    /// 标量 double：走 FP 寄存器组。
+    pub is_float: bool,
+    /// struct/union 按值传递。
+    pub is_aggregate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +60,15 @@ pub enum Instr {
         dst: Temp,
         name: String,
         args: Vec<Temp>,
+        /// 每个实参是否为浮点（double）——决定走 GP 还是 FP 寄存器。
+        arg_floats: Vec<bool>,
+        /// 每个实参若为按值结构体则给出其字节大小（此时实参 temp 存放的是结构体地址）。
+        arg_aggs: Vec<Option<usize>>,
         ret_width: usize,
+        /// 按值返回结构体时的字节大小；标量/指针为 None。
+        ret_agg: Option<usize>,
+        /// 结构体返回值要写入的帧内缓冲区偏移（与 ret_agg 同时存在）。
+        ret_buf: Option<usize>,
         fixed: usize,
         variadic: bool,
         ret_float: bool,
@@ -63,16 +92,18 @@ pub enum Instr {
         src: Temp,
     },
     StrLit { dst: Temp, index: usize },
-    LoadArg { dst: Temp, index: usize, width: usize },
     AddrOf { dst: Temp, off: usize },
     GlobalAddr { dst: Temp, name: String },
     FieldAddr { dst: Temp, base: Temp, offset: usize },
     Copy { dst: Temp, src: Temp, width: usize },
+    /// 按值拷贝 `size` 字节：`dst`、`src` 为存放目标/源地址的临时量（结构体赋值/初始化）。
+    MemCpy { dst: Temp, src: Temp, size: usize },
     LoadInd { dst: Temp, addr: Temp, width: usize, signed: bool },
     StoreInd { addr: Temp, src: Temp, width: usize },
     PtrAdd { dst: Temp, base: Temp, index: Temp, shift: u32 },
     PtrSub { dst: Temp, base: Temp, index: Temp, shift: u32 },
-    Return { src: Temp, is_float: bool, width: usize },
+    /// `agg` 为 Some(size) 时按值返回结构体，`src` 存放结构体地址。
+    Return { src: Temp, is_float: bool, width: usize, agg: Option<usize> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +188,14 @@ impl<'a> Lowerer<'a> {
         off
     }
 
+    /// 分配 `size` 字节（向上对齐到 8）的匿名缓冲区，返回其偏移。
+    fn alloc_bytes(&mut self, size: usize) -> usize {
+        let aligned = size.div_ceil(8).max(1) * 8;
+        let off = self.next_offset;
+        self.next_offset += aligned;
+        off
+    }
+
     fn new_label(&mut self) -> usize {
         let l = self.next_label;
         self.next_label += 1;
@@ -194,6 +233,21 @@ impl<'a> Lowerer<'a> {
 
     fn size_of(&self, ty: &Type) -> usize {
         crate::types::size_of(ty, self.aggregates)
+    }
+
+    /// 把 `src` 写入地址 `addr`：结构体按值整体拷贝，标量按宽度存储。
+    /// （结构体值在本 IR 中统一以地址表示，故 `src` 此时存的是源结构体地址。）
+    fn store_into(&mut self, addr: Temp, src: Temp, ty: &Type) {
+        match ty {
+            Type::Struct(_) | Type::Union(_) => {
+                let size = self.size_of(ty);
+                self.body.push(Instr::MemCpy { dst: addr, src, size });
+            }
+            _ => {
+                let width = self.size_of(ty);
+                self.body.push(Instr::StoreInd { addr, src, width });
+            }
+        }
     }
 
     /// 在 int 与 double 之间按需插入转换指令，返回结果临时量。
@@ -257,12 +311,27 @@ impl<'a> Lowerer<'a> {
             Stmt::Return(e) => {
                 let (v, ety) = self.lower_expr(e);
                 let ret_ty = self.ret_ty.clone();
-                let src = self.coerce(v, &ety, &ret_ty);
-                self.body.push(Instr::Return {
-                    src,
-                    is_float: matches!(ret_ty, Type::Double),
-                    width: if matches!(ret_ty, Type::Pointer(_)) { 8 } else { 4 },
-                });
+                match ret_ty {
+                    Type::Struct(_) | Type::Union(_) => {
+                        // v 存放结构体地址；后端按 size 经返回寄存器或隐式指针回写。
+                        let size = self.size_of(&ret_ty);
+                        self.body.push(Instr::Return {
+                            src: v,
+                            is_float: false,
+                            width: 8,
+                            agg: Some(size),
+                        });
+                    }
+                    _ => {
+                        let src = self.coerce(v, &ety, &ret_ty);
+                        self.body.push(Instr::Return {
+                            src,
+                            is_float: matches!(ret_ty, Type::Double),
+                            width: if matches!(ret_ty, Type::Pointer(_)) { 8 } else { 4 },
+                            agg: None,
+                        });
+                    }
+                }
             }
             Stmt::Declare { name, ty, init } => {
                 let off = self.declare_var(name, ty.clone());
@@ -271,8 +340,7 @@ impl<'a> Lowerer<'a> {
                     let v = self.coerce(v0, &vty, ty);
                     let addr = self.fresh();
                     self.body.push(Instr::AddrOf { dst: addr, off });
-                    let width = self.size_of(ty);
-                    self.body.push(Instr::StoreInd { addr, src: v, width });
+                    self.store_into(addr, v, ty);
                 }
             }
             Stmt::ExprStmt(e) => {
@@ -592,37 +660,79 @@ impl<'a> Lowerer<'a> {
                 let (v0, vty) = self.lower_expr(value);
                 let (addr, ty) = self.lower_lvalue(target);
                 let v = self.coerce(v0, &vty, &ty);
-                let width = self.size_of(&ty);
-                self.body.push(Instr::StoreInd {
-                    addr,
-                    src: v,
-                    width,
-                });
+                self.store_into(addr, v, &ty);
                 (v, ty)
             }
             Expr::Call { name, args } => {
-                let arg_temps: Vec<Temp> = args.iter().map(|a| self.lower_expr(a).0).collect();
-                let dst = self.fresh();
-                let sig = self.signatures.get(name);
-                let ret = sig.map(|s| s.ret.clone()).unwrap_or(Type::Int);
+                let sig = self.signatures.get(name).cloned();
+                let param_types: Vec<Type> =
+                    sig.as_ref().map(|s| s.params.clone()).unwrap_or_default();
+                let mut arg_temps: Vec<Temp> = Vec::with_capacity(args.len());
+                let mut arg_floats: Vec<bool> = Vec::with_capacity(args.len());
+                let mut arg_aggs: Vec<Option<usize>> = Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                    let (t0, ty0) = self.lower_expr(a);
+                    // 已知形参类型时，把实参按形参类型隐式转换（如 int → double）。
+                    let (t, ty) = match param_types.get(i) {
+                        Some(pt) => (self.coerce(t0, &ty0, pt), pt.clone()),
+                        None => (t0, ty0),
+                    };
+                    arg_temps.push(t);
+                    arg_floats.push(matches!(ty, Type::Double));
+                    arg_aggs.push(match ty {
+                        Type::Struct(_) | Type::Union(_) => Some(self.size_of(&ty)),
+                        _ => None,
+                    });
+                }
+                let ret = sig.as_ref().map(|s| s.ret.clone()).unwrap_or(Type::Int);
                 let ret_float = matches!(ret, Type::Double);
+                let ret_agg = match ret {
+                    Type::Struct(_) | Type::Union(_) => Some(self.size_of(&ret)),
+                    _ => None,
+                };
                 let ret_width = if matches!(ret, Type::Pointer(_) | Type::Double) {
                     8
                 } else {
                     4
                 };
-                let fixed = sig.map(|s| s.fixed).unwrap_or(arg_temps.len());
-                let variadic = sig.map(|s| s.variadic).unwrap_or(false);
-                self.body.push(Instr::Call {
-                    dst,
-                    name: name.clone(),
-                    args: arg_temps,
-                    ret_width,
-                    fixed,
-                    variadic,
-                    ret_float,
-                });
-                (dst, ret)
+                let fixed = sig.as_ref().map(|s| s.fixed).unwrap_or(arg_temps.len());
+                let variadic = sig.as_ref().map(|s| s.variadic).unwrap_or(false);
+                if let Some(size) = ret_agg {
+                    // 结构体返回：分配缓冲区，Call 把结果写入，表达式求值为其地址。
+                    let buf = self.alloc_bytes(size);
+                    self.body.push(Instr::Call {
+                        dst: 0,
+                        name: name.clone(),
+                        args: arg_temps,
+                        arg_floats,
+                        arg_aggs,
+                        ret_width,
+                        ret_agg,
+                        ret_buf: Some(buf),
+                        fixed,
+                        variadic,
+                        ret_float,
+                    });
+                    let addr = self.fresh();
+                    self.body.push(Instr::AddrOf { dst: addr, off: buf });
+                    (addr, ret)
+                } else {
+                    let dst = self.fresh();
+                    self.body.push(Instr::Call {
+                        dst,
+                        name: name.clone(),
+                        args: arg_temps,
+                        arg_floats,
+                        arg_aggs,
+                        ret_width,
+                        ret_agg: None,
+                        ret_buf: None,
+                        fixed,
+                        variadic,
+                        ret_float,
+                    });
+                    (dst, ret)
+                }
             }
         }
     }
@@ -864,14 +974,25 @@ fn lower_func(
         break_targets: Vec::new(),
         continue_targets: Vec::new(),
     };
-    // 参数占据前若干槽，从入参寄存器直接落到各自槽位。
-    for (index, (pname, pty)) in f.params.iter().enumerate() {
-        let width = lw.size_of(pty);
+    let ret_agg = match f.ret {
+        Type::Struct(_) | Type::Union(_) => Some(lw.size_of(&f.ret)),
+        _ => None,
+    };
+    // 大结构体返回（>16 字节）走隐式指针：序言把它存到此槽，Return 时据此回写。
+    let sret_slot = match ret_agg {
+        Some(sz) if sz > 16 => Some(lw.alloc_bytes(8)),
+        _ => None,
+    };
+    // 形参占据前若干槽；具体来自哪个寄存器/栈位由后端按 ABI 决定（见 Function.params）。
+    let mut params = Vec::with_capacity(f.params.len());
+    for (pname, pty) in f.params.iter() {
+        let size = lw.size_of(pty);
         let off = lw.declare_var(pname, pty.clone());
-        lw.body.push(Instr::LoadArg {
-            dst: off,
-            index,
-            width,
+        params.push(crate::ir::Param {
+            slot: off,
+            size,
+            is_float: matches!(pty, Type::Double),
+            is_aggregate: matches!(pty, Type::Struct(_) | Type::Union(_)),
         });
     }
     for stmt in &f.body {
@@ -879,8 +1000,12 @@ fn lower_func(
     }
     Function {
         name: f.name.clone(),
+        params,
         body: lw.body,
         frame_bytes: lw.next_offset,
+        ret_float: matches!(f.ret, Type::Double),
+        ret_agg,
+        sret_slot,
     }
 }
 
@@ -909,7 +1034,7 @@ mod tests {
             f.body,
             vec![
                 Instr::Const { dst: 0, value: 42 },
-                Instr::Return { src: 0, is_float: false, width: 4 },
+                Instr::Return { src: 0, is_float: false, width: 4, agg: None },
             ]
         );
     }
@@ -924,7 +1049,7 @@ mod tests {
                 Instr::Const { dst: 0, value: 1 },
                 Instr::Const { dst: 8, value: 2 },
                 Instr::Bin { dst: 16, op: BinOp::Add, lhs: 0, rhs: 8 },
-                Instr::Return { src: 16, is_float: false, width: 4 },
+                Instr::Return { src: 16, is_float: false, width: 4, agg: None },
             ]
         );
     }
@@ -937,7 +1062,7 @@ mod tests {
             f.body,
             vec![
                 Instr::Const { dst: 0, value: 7 },
-                Instr::Return { src: 0, is_float: false, width: 4 },
+                Instr::Return { src: 0, is_float: false, width: 4, agg: None },
             ]
         );
     }
@@ -950,7 +1075,7 @@ mod tests {
             vec![
                 Instr::Const { dst: 0, value: 7 },
                 Instr::Neg { dst: 8, src: 0 },
-                Instr::Return { src: 8, is_float: false, width: 4 },
+                Instr::Return { src: 8, is_float: false, width: 4, agg: None },
             ]
         );
     }
@@ -1002,15 +1127,32 @@ mod tests {
     }
 
     #[test]
-    fn lower_params_emit_loadarg() {
+    fn lower_records_params() {
         let p = lower_prog("int add(int a, int b){ return a+b; } int main(){ return add(1,2); }");
         let add = p.functions.iter().find(|f| f.name == "add").unwrap();
-        let loadargs = add
-            .body
-            .iter()
-            .filter(|i| matches!(i, Instr::LoadArg { .. }))
-            .count();
-        assert_eq!(loadargs, 2);
+        assert_eq!(add.params.len(), 2);
+        assert!(add.params.iter().all(|p| !p.is_float && !p.is_aggregate && p.size == 4));
+    }
+
+    #[test]
+    fn lower_double_param_marked_float() {
+        let p = lower_prog("double f(int a, double b){ return b; } int main(){ return 0; }");
+        let f = p.functions.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(f.params.len(), 2);
+        assert!(!f.params[0].is_float);
+        assert!(f.params[1].is_float);
+        assert!(f.ret_float);
+    }
+
+    #[test]
+    fn lower_struct_param_marked_aggregate() {
+        let p = lower_prog(
+            "struct P { int x; int y; }; int f(struct P p){ return p.x; } int main(){ return 0; }",
+        );
+        let f = p.functions.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(f.params.len(), 1);
+        assert!(f.params[0].is_aggregate);
+        assert_eq!(f.params[0].size, 16); // anvil 把每个字段按 8 字节槽位排布
     }
 
     #[test]

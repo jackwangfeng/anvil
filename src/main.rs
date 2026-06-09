@@ -1,11 +1,19 @@
-use anvil::compile_to_asm;
 use anvil::preprocess::preprocess;
+use anvil::{compile_to_asm_target, host_target, Target};
 use std::path::Path;
 use std::process::{exit, Command};
 
+struct Options {
+    input: String,
+    output: String,
+    target: Target,
+    /// 仅生成汇编（`-S`），不汇编链接。
+    asm_only: bool,
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let (input, output) = match parse_args(&args) {
+    let opts = match parse_args(&args) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("{}", msg);
@@ -13,41 +21,56 @@ fn main() {
         }
     };
 
-    let src = match std::fs::read_to_string(&input) {
+    let src = match std::fs::read_to_string(&opts.input) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: cannot read '{}': {}", input, e);
+            eprintln!("error: cannot read '{}': {}", opts.input, e);
             exit(1);
         }
     };
 
-    let base_dir = Path::new(&input).parent().unwrap_or(Path::new("."));
+    let base_dir = Path::new(&opts.input).parent().unwrap_or(Path::new("."));
     let preprocessed = match preprocess(&src, base_dir) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{}:{}", input, e);
+            eprintln!("{}:{}", opts.input, e);
             exit(1);
         }
     };
 
-    let asm = match compile_to_asm(&preprocessed) {
+    let asm = match compile_to_asm_target(&preprocessed, opts.target) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("{}:{}", input, e);
+            eprintln!("{}:{}", opts.input, e);
             exit(1);
         }
     };
 
-    let asm_path = format!("{}.s", output);
+    // -S：直接把汇编写到输出文件，不汇编链接。
+    if opts.asm_only {
+        if let Err(e) = std::fs::write(&opts.output, &asm) {
+            eprintln!("error: cannot write '{}': {}", opts.output, e);
+            exit(1);
+        }
+        return;
+    }
+
+    let asm_path = format!("{}.s", opts.output);
     if let Err(e) = std::fs::write(&asm_path, &asm) {
         eprintln!("error: cannot write '{}': {}", asm_path, e);
         exit(1);
     }
 
-    let status = Command::new("clang")
+    // 汇编 + 链接：x86-64 用本机 gcc；arm64/macOS 用 clang。
+    let (assembler, extra): (&str, &[&str]) = match opts.target {
+        Target::X86_64 => ("gcc", &["-no-pie"]),
+        Target::Arm64 => ("clang", &[]),
+    };
+    let status = Command::new(assembler)
         .arg(&asm_path)
+        .args(extra)
         .arg("-o")
-        .arg(&output)
+        .arg(&opts.output)
         .status();
 
     match status {
@@ -55,19 +78,21 @@ fn main() {
             let _ = std::fs::remove_file(&asm_path);
         }
         Ok(s) => {
-            eprintln!("error: clang failed: {}", s);
+            eprintln!("error: {} failed: {}", assembler, s);
             exit(1);
         }
         Err(e) => {
-            eprintln!("error: failed to invoke clang: {}", e);
+            eprintln!("error: failed to invoke {}: {}", assembler, e);
             exit(1);
         }
     }
 }
 
-fn parse_args(args: &[String]) -> Result<(String, String), String> {
+fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
+    let mut target = host_target();
+    let mut asm_only = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -78,6 +103,27 @@ fn parse_args(args: &[String]) -> Result<(String, String), String> {
                 }
                 output = Some(args[i].clone());
             }
+            "-S" => asm_only = true,
+            "--target" => {
+                i += 1;
+                target = match args.get(i).map(|s| s.as_str()) {
+                    Some("arm64") | Some("aarch64") => Target::Arm64,
+                    Some("x86_64") | Some("x86-64") | Some("amd64") => Target::X86_64,
+                    other => {
+                        return Err(format!(
+                            "error: --target expects arm64|x86_64, got {:?}",
+                            other
+                        ))
+                    }
+                };
+            }
+            other if other.starts_with("--target=") => {
+                target = match &other["--target=".len()..] {
+                    "arm64" | "aarch64" => Target::Arm64,
+                    "x86_64" | "x86-64" | "amd64" => Target::X86_64,
+                    t => return Err(format!("error: unknown target '{}'", t)),
+                };
+            }
             other => {
                 if input.is_some() {
                     return Err(format!("error: unexpected argument '{}'", other));
@@ -87,12 +133,19 @@ fn parse_args(args: &[String]) -> Result<(String, String), String> {
         }
         i += 1;
     }
-    let input = input.ok_or_else(|| "usage: anvil <input.c> [-o output]".to_string())?;
+    let input = input.ok_or_else(|| {
+        "usage: anvil <input.c> [-o output] [-S] [--target arm64|x86_64]".to_string()
+    })?;
     let output = output.unwrap_or_else(|| {
         Path::new(&input)
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "a.out".to_string())
     });
-    Ok((input, output))
+    Ok(Options {
+        input,
+        output,
+        target,
+        asm_only,
+    })
 }
